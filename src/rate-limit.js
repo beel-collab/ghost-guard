@@ -55,7 +55,7 @@ export class MemoryRateLimiter {
   }
 }
 
-// One SQLite-backed Durable Object per publication. A synchronous transaction
+// One SQLite-backed Durable Object per Worker deployment. A synchronous transaction
 // reserves quotas atomically across concurrent Worker instances. IP attempts
 // are reserved before Turnstile; email attempts only after verification.
 export class SignupRateLimiter {

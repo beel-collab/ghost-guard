@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import { gzipSync, deflateSync, brotliCompressSync } from 'node:zlib';
-import { createGuardServer } from '../sidecar/server.mjs';
+import { createGuardServer, parseTrustedProxies } from '../sidecar/server.mjs';
 
 async function listen(t, server) {
   server.listen(0, '127.0.0.1');
@@ -208,4 +208,39 @@ test('response hop headers are not relayed to the client', async (t) => {
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('x-discard'), null);
   assert.equal(await response.text(), '{}');
+});
+
+test('TRUSTED_PROXIES: only a listed peer may set the client IP and scheme', async (t) => {
+  const listed = await setup(t, { SIGNUP_IP_LIMIT: '1', TRUSTED_PROXIES: '127.0.0.1' });
+  assert.equal((await send(listed.guard, {}, { 'X-Forwarded-For': '192.0.2.1', 'X-Forwarded-Proto': 'https' })).status, 201);
+  assert.equal(listed.calls[0].headers['x-forwarded-for'], '192.0.2.1');
+  assert.equal(listed.calls[0].headers['x-forwarded-proto'], 'https');
+
+  // The test client connects from 127.0.0.1, which is not in this list.
+  const unlisted = await setup(t, { SIGNUP_IP_LIMIT: '1', TRUSTED_PROXIES: '10.0.0.0/8' });
+  assert.equal((await send(unlisted.guard, {}, { 'X-Forwarded-For': '192.0.2.1', 'X-Forwarded-Proto': 'https' })).status, 201);
+  assert.equal(unlisted.calls[0].headers['x-forwarded-for'], '127.0.0.1');
+  assert.equal(unlisted.calls[0].headers['x-forwarded-proto'], 'http');
+  assert.equal((await send(unlisted.guard, { email: 'other@work.example' }, { 'X-Forwarded-For': '192.0.2.2' })).status, 429);
+});
+
+test('TRUSTED_PROXIES: the client is the rightmost entry that is not one of our proxies', async (t) => {
+  const { guard, calls } = await setup(t, { TRUSTED_PROXIES: '127.0.0.1, 198.51.100.0/24' });
+  // Client-sent value, then the real client, then a trusted load balancer.
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': '203.0.113.9, 192.0.2.9, 198.51.100.5' });
+  assert.equal(calls[0].headers['x-forwarded-for'], '192.0.2.9');
+});
+
+test('TRUSTED_PROXIES rejects entries it cannot parse', () => {
+  for (const bad of ['nginx', '10.0.0.0/33', '::1/129', '10.0.0.0/8/1', '10.0.0.0/x']) {
+    assert.throws(() => parseTrustedProxies(bad), /TRUSTED_PROXIES/);
+    assert.throws(() => createGuardServer({ TRUSTED_PROXIES: bad }), /TRUSTED_PROXIES/);
+  }
+  assert.doesNotThrow(() => parseTrustedProxies('127.0.0.1, ::1, 172.16.0.0/12, fd00::/8'));
+});
+
+test('legacy TRUST_PROXY=true warns at startup', (t) => {
+  const warnings = t.mock.method(console, 'warn', () => {});
+  createGuardServer({ TRUST_PROXY: 'true' });
+  assert.match(String(warnings.mock.calls[0].arguments), /TRUSTED_PROXIES/);
 });

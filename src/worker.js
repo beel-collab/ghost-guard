@@ -196,10 +196,18 @@ function originForwardHeaders(request, env) {
 }
 
 async function forwardToOrigin(request, env) {
+  // Ghost trusts every proxy and takes the leftmost X-Forwarded-For entry as the
+  // client, and Cloudflare only appends to what the client sent. Replace the
+  // header with the address Cloudflare (or the sidecar) resolved, so clients
+  // cannot dodge Ghost's per-IP throttling, which is all that limits sign-ins.
+  const clientIp = request.headers.get('CF-Connecting-IP');
   const origin = (env.GHOST_ORIGIN || '').replace(/\/+$/, '');
   if (!origin) {
     // Same-zone routing: the bypass header (set by confirmAndForward) prevents a loop.
-    return fetch(request);
+    if (!clientIp) return fetch(request);
+    const sameZoneHeaders = new Headers(request.headers);
+    sameZoneHeaders.set('X-Forwarded-For', clientIp);
+    return fetch(new Request(request, { headers: sameZoneHeaders }));
   }
 
   const url = new URL(request.url);
@@ -209,6 +217,7 @@ async function forwardToOrigin(request, env) {
   target.search = url.search;
   target.hash = '';
   const headers = new Headers(request.headers);
+  if (clientIp) headers.set('X-Forwarded-For', clientIp);
   headers.set('Host', new URL(origin).host);
   if (env.CONFIRM_SECRET) {
     headers.set(BYPASS_HEADER, env.CONFIRM_SECRET);

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /** Shared Worker logic, adapted to Node 22+ HTTP and per-process rate storage. */
 import http from 'node:http';
+import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import worker from '../src/worker.js';
@@ -16,7 +17,63 @@ function stripHopByHop(headers) {
   }
 }
 
+function plainAddress(value) {
+  const address = String(value || '').trim();
+  return address.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)?.[1] ?? address;
+}
+
+// TRUSTED_PROXIES: comma-separated addresses or CIDR ranges, e.g.
+// "127.0.0.1,172.16.0.0/12". Throws on an entry it cannot parse.
+export function parseTrustedProxies(value) {
+  const list = new net.BlockList();
+  for (const entry of String(value || '').split(',').map((item) => item.trim()).filter(Boolean)) {
+    const [address, prefix, extra] = entry.split('/');
+    const version = net.isIP(address);
+    const type = version === 6 ? 'ipv6' : 'ipv4';
+    const bits = Number(prefix);
+    if (!version || extra !== undefined || (prefix !== undefined && (!/^\d+$/.test(prefix) || bits > (version === 6 ? 128 : 32)))) {
+      throw new Error(`TRUSTED_PROXIES: invalid entry "${entry}"`);
+    }
+    if (prefix === undefined) list.addAddress(address, type);
+    else list.addSubnet(address, bits, type);
+  }
+  return list;
+}
+
+// Decides which peers may set X-Forwarded-For/-Proto and which XFF entries are
+// our own proxies. TRUST_PROXY=true (legacy) trusts every peer and uses the
+// rightmost entry.
+function proxyTrust(env) {
+  if (env.TRUSTED_PROXIES) {
+    const list = parseTrustedProxies(env.TRUSTED_PROXIES);
+    const listed = (value) => {
+      const address = plainAddress(value);
+      const version = net.isIP(address);
+      return version !== 0 && list.check(address, version === 6 ? 'ipv6' : 'ipv4');
+    };
+    return { peer: listed, hop: listed };
+  }
+  if (env.TRUST_PROXY === 'true') {
+    console.warn('ghost-guard: TRUST_PROXY=true trusts X-Forwarded-For from any peer; set TRUSTED_PROXIES to your proxy addresses instead');
+    return { peer: () => true, hop: () => false };
+  }
+  return { peer: () => false, hop: () => false };
+}
+
+// Walk X-Forwarded-For from the right past our own proxies; the first other
+// entry is the client. Untrusted peers are the client themselves.
+function resolveClient(req, trust) {
+  const peer = plainAddress(req.socket.remoteAddress);
+  if (!trust.peer(peer)) return { ip: peer, trusted: false };
+  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(plainAddress).filter(Boolean);
+  for (let i = hops.length - 1; i >= 0; i--) {
+    if (!trust.hop(hops[i])) return { ip: hops[i], trusted: true };
+  }
+  return { ip: hops[0] || peer, trusted: true };
+}
+
 export function createGuardServer(env = process.env) {
+  const trust = proxyTrust(env);
   const workerEnv = {
     ...env,
     GHOST_ORIGIN: (env.GHOST_ORIGIN || 'http://127.0.0.1:2368').replace(/\/+$/, ''),
@@ -47,12 +104,7 @@ export function createGuardServer(env = process.env) {
       for (const [key, value] of Object.entries(req.headers)) {
         if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value);
       }
-      // Use the entry the trusted proxy added: the rightmost one. Proxies that
-      // append (nginx's $proxy_add_x_forwarded_for) keep client-sent values on
-      // the left; proxies that overwrite leave a single entry.
-      const ip = env.TRUST_PROXY === 'true'
-        ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',').at(-1).trim()
-        : req.socket.remoteAddress;
+      const { ip, trusted } = resolveClient(req, trust);
       stripHopByHop(headers);
       headers.delete('content-length');
       headers.set('CF-Connecting-IP', ip || 'unknown');
@@ -60,7 +112,7 @@ export function createGuardServer(env = process.env) {
       headers.delete('X-Ghost-Signup-Shield');
       const socketProtocol = req.socket.encrypted ? 'https' : 'http';
       const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').trim().toLowerCase();
-      headers.set('X-Forwarded-Proto', env.TRUST_PROXY === 'true' && ['http', 'https'].includes(forwardedProtocol)
+      headers.set('X-Forwarded-Proto', trusted && ['http', 'https'].includes(forwardedProtocol)
         ? forwardedProtocol : socketProtocol);
       headers.set('Accept-Encoding', 'identity');
       const method = req.method || 'GET';

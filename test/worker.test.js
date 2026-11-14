@@ -236,3 +236,13 @@ test('email-quota rejections still count as IP attempts', async (t) => {
   assert.equal((await worker.fetch(signup({ email: 'third@work.example' }), env)).status, 429);
   assert.equal(calls.origin.length, 2);
 });
+
+for (const [name, env] of [['an external origin', envFor()], ['same-zone routing', envFor({ GHOST_ORIGIN: undefined })]]) {
+  test(`Ghost receives the resolved client IP, not client-sent X-Forwarded-For, via ${name}`, async (t) => {
+    const calls = mockFetch(t);
+    const spoofed = { 'X-Forwarded-For': '203.0.113.7' };
+    await worker.fetch(signup({ emailType: 'signin' }, spoofed), env);
+    await worker.fetch(new Request('https://blog.example/about/', { headers: { 'CF-Connecting-IP': '192.0.2.1', ...spoofed } }), env);
+    assert.deepEqual(calls.origin.map((request) => request.headers.get('x-forwarded-for')), ['192.0.2.1', '192.0.2.1']);
+  });
+}
