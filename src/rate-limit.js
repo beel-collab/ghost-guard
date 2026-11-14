@@ -128,7 +128,9 @@ export async function checkSignupEmailRateLimit(request, email, env) {
 async function consumeBuckets(request, env, buckets) {
   if (env.LOCAL_RATE_LIMITER) return env.LOCAL_RATE_LIMITER.consume(buckets);
   if (!env.SIGNUP_RATE_LIMITER) throw new Error('SIGNUP_RATE_LIMITER binding is required');
-  const id = env.SIGNUP_RATE_LIMITER.idFromName(new URL(request.url).origin);
+  // One fixed object per deployment: keying by the request's hostname would
+  // give www., http:// and *.workers.dev their own quotas.
+  const id = env.SIGNUP_RATE_LIMITER.idFromName('signup');
   const response = await env.SIGNUP_RATE_LIMITER.get(id).fetch('https://rate-limiter/consume', {
     method: 'POST',
     body: JSON.stringify({ buckets }),

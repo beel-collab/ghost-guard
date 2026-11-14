@@ -159,7 +159,7 @@ test('confirmation POST and signin magic links do not need Turnstile', async (t)
 
 test('webhook refuses missing signing configuration and invalid signatures', async (t) => {
   const calls = mockFetch(t);
-  const env = envFor({ CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example', ADMIN_API_KEY: 'id:0123456789abcdef' });
+  const env = envFor({ CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example', ADMIN_API_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4) });
   const request = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
   assert.equal((await worker.fetch(request(), env)).status, 503);
   assert.equal((await worker.fetch(request(), { ...env, WEBHOOK_SECRET: 'secret' })).status, 401);

@@ -8,7 +8,7 @@ const memberId = '111111111111111111111111';
 const label = { id: '222222222222222222222222', name: 'signup-shield-review' };
 const env = {
   CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example',
-  ADMIN_API_KEY: 'id:0123456789abcdef', WEBHOOK_SECRET: 'webhook-secret',
+  ADMIN_API_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4), WEBHOOK_SECRET: 'webhook-secret',
 };
 function event(member = { id: memberId, email: 'reader@work.example', status: 'free', labels: [] }) {
   const body = JSON.stringify({ member: { current: member } });
@@ -176,23 +176,55 @@ test('sidecar acknowledges within Ghost\'s timeout and labels in the background'
 test('sidecar retries a failed labelling until it succeeds', async (t) => {
   const state = ghost(t);
   state.readFailures = 2;
+  const warnings = t.mock.method(console, 'warn', () => {});
   const queue = new LocalLabelQueue([0, 0, 0]);
   assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 202);
   await queue.idle();
   assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
   assert.equal(queue.queue.pending.size, 0);
+  assert.equal(warnings.mock.callCount(), 2);
+  assert.match(String(warnings.mock.calls[0].arguments), /Admin API 503.*retrying/);
 });
 
 test('sidecar gives up after the retry schedule and logs without the member data', async (t) => {
   const state = ghost(t);
   state.readStatus = 503;
   const errors = t.mock.method(console, 'error', () => {});
+  t.mock.method(console, 'warn', () => {});
   const queue = new LocalLabelQueue([0, 0]);
   assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 202);
   await queue.idle();
   assert.equal(state.calls.length, 3);
   assert.equal(errors.mock.callCount(), 1);
+  assert.match(String(errors.mock.calls[0].arguments), /Admin API 503.*giving up/);
   assert.doesNotMatch(String(errors.mock.calls[0].arguments), /reader@|1111/);
+});
+
+for (const [name, config] of [
+  ['a malformed Admin API key', { ADMIN_API_KEY: 'id:secret' }],
+  ['a non-hex Admin API secret', { ADMIN_API_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaa:' + 'z'.repeat(64) }],
+  ['an invalid Admin API URL', { ADMIN_API_URL: 'admin.example' }],
+]) {
+  test(`webhook reports ${name} to Ghost instead of acknowledging`, async (t) => {
+    const state = ghost(t);
+    const queue = new LocalLabelQueue([]);
+    const response = await worker.fetch(event(), { ...env, ...config, LOCAL_MEMBER_LABELLER: queue });
+    assert.equal(response.status, 503);
+    assert.match((await response.json()).error, /ADMIN_API_(KEY|URL)/);
+    await queue.idle();
+    assert.equal(state.calls.length, 0);
+  });
+}
+
+test('sidecar does not retry errors that retrying cannot fix', async (t) => {
+  const state = ghost(t);
+  state.readStatus = 401;
+  const errors = t.mock.method(console, 'error', () => {});
+  const queue = new LocalLabelQueue([0, 0, 0]);
+  assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 202);
+  await queue.idle();
+  assert.equal(state.calls.length, 1);
+  assert.match(String(errors.mock.calls[0].arguments), /Admin API 401.*not retrying/);
 });
 
 test('sidecar overlapping deliveries serialize the fresh read and unconditional insert', { timeout: 3000 }, async (t) => {
@@ -267,6 +299,7 @@ test('Worker retries failed labelling on the backoff schedule', async (t) => {
   const state = ghost(t);
   const { storage, fire, config } = durable();
   state.readStatus = 503;
+  t.mock.method(console, 'warn', () => {});
   assert.equal((await worker.fetch(event(), config)).status, 202);
   const before = Date.now();
   await fire();
@@ -282,11 +315,15 @@ test('Worker keeps a delivery that arrives while a retry is pending or a run is 
   const state = ghost(t);
   const { storage, fire, config } = durable();
   state.readStatus = 503;
+  t.mock.method(console, 'warn', () => {});
   await worker.fetch(event(), config);
   await fire();
-  // A new delivery brings the pending retry forward.
+  await fire();
+  assert.equal(storage.data.get('attempt'), 2);
+  // A new delivery brings the pending retry forward with a fresh budget.
   await worker.fetch(event(), config);
   assert.ok(storage.alarm <= Date.now());
+  assert.equal(storage.data.get('attempt'), 0);
   state.readStatus = 200;
   state.beforeBulk = () => worker.fetch(event(), config);
   await fire();
@@ -302,10 +339,48 @@ test('Worker gives up after the retry schedule', async (t) => {
   const { storage, fire, config } = durable();
   state.readStatus = 503;
   const errors = t.mock.method(console, 'error', () => {});
+  t.mock.method(console, 'warn', () => {});
   await worker.fetch(event(), config);
   for (let i = 0; i <= RETRY_DELAYS_MS.length; i++) await fire();
   assert.equal(state.calls.length, RETRY_DELAYS_MS.length + 1);
   assert.equal(errors.mock.callCount(), 1);
   assert.equal(storage.data.size, 0);
   assert.equal(storage.alarm, null);
+});
+
+test('Worker does not retry errors that retrying cannot fix', async (t) => {
+  const state = ghost(t);
+  const { storage, fire, config } = durable();
+  state.readStatus = 403;
+  const errors = t.mock.method(console, 'error', () => {});
+  await worker.fetch(event(), config);
+  await fire();
+  assert.equal(state.calls.length, 1);
+  assert.equal(storage.alarm, null);
+  assert.equal(storage.data.size, 0);
+  assert.match(String(errors.mock.calls[0].arguments), /Admin API 403.*not retrying/);
+});
+
+test('Worker keeps a delivery that arrives during the final attempt', async (t) => {
+  const state = ghost(t);
+  const { storage, fire, config } = durable();
+  state.readStatus = 503;
+  t.mock.method(console, 'warn', () => {});
+  await worker.fetch(event(), config);
+  for (let i = 0; i < RETRY_DELAYS_MS.length; i++) await fire();
+  assert.equal(storage.data.get('attempt'), RETRY_DELAYS_MS.length);
+  // The final attempt fails while a new delivery arrives.
+  const originalGet = storage.get;
+  storage.get = async (key) => {
+    if (key === 'id') { storage.get = originalGet; await worker.fetch(event(), config); }
+    return originalGet(key);
+  };
+  await fire();
+  assert.notEqual(storage.alarm, null);
+  assert.equal(storage.data.get('id'), memberId);
+  assert.equal(storage.data.get('attempt'), 0);
+  state.readStatus = 200;
+  await fire();
+  assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
+  assert.equal(storage.data.size, 0);
 });

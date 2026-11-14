@@ -78,16 +78,18 @@ test('Durable Object counters survive object reconstruction and expired rows are
   assert.equal(storage.sql.exec('SELECT key FROM counters').toArray().length, 0);
 });
 
-test('Worker uses the durable namespace and stores digests instead of email/IP', async () => {
-  const seen = { bodies: [] };
+test('Worker uses one durable object for every hostname and stores digests instead of email/IP', async () => {
+  const seen = { bodies: [], names: [] };
   const env = { SIGNUP_RATE_LIMITER: {
-    idFromName: (name) => { seen.name = name; return 'object-id'; },
+    idFromName: (name) => { seen.names.push(name); return 'object-id'; },
     get: (id) => ({ async fetch(url, init) { seen.id = id; seen.bodies.push(init.body); return Response.json({ allowed: true }); } }),
   } };
   const request = new Request('https://blog.example/members/api/send-magic-link/', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
   assert.equal((await checkSignupIpRateLimit(request, env)).allowed, true);
   assert.equal((await checkSignupEmailRateLimit(request, 'Reader@Work.Example', env)).allowed, true);
-  assert.equal(seen.name, 'https://blog.example');
+  const alias = new Request('http://www.blog.example/Members/api/send-magic-link/', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
+  await checkSignupIpRateLimit(alias, env);
+  assert.deepEqual(seen.names, ['signup', 'signup', 'signup']);
   assert.equal(seen.id, 'object-id');
   for (const body of seen.bodies) assert.doesNotMatch(body, /192\.0\.2\.1|reader|work\.example/i);
   assert.match(JSON.parse(seen.bodies[0]).buckets[0].key, /^ip:[a-f0-9]{64}$/);

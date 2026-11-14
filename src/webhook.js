@@ -3,8 +3,27 @@ const REVIEW_LABEL = 'signup-shield-review';
 
 // Ghost sends each webhook once: a POST with a 2 s timeout that is not retried.
 // Handlers therefore acknowledge immediately and label in the background,
-// retrying on this schedule (about 3.5 hours in total).
+// retrying on this schedule (just under 3 hours in total).
 export const RETRY_DELAYS_MS = [30e3, 60e3, 120e3, 300e3, 900e3, 1800e3, 3600e3, 3600e3];
+
+// Retrying cannot fix bad credentials, missing permissions or a malformed
+// setting. Timeouts, network errors, 408, 429 and 5xx are worth retrying.
+function isTerminal(error) {
+  const status = error?.status;
+  return error?.terminal === true || (status >= 400 && status < 500 && ![408, 429].includes(status));
+}
+
+// Logs the reason (an Admin API status or our own message), never member data.
+function logFailure(error, outcome) {
+  const log = outcome === 'retrying' ? console.warn : console.error;
+  log(`ghost-guard: member labelling failed (${error?.message || 'unknown error'}); ${outcome}`);
+}
+
+function terminalError(message) {
+  const error = new Error(message);
+  error.terminal = true;
+  return error;
+}
 
 // Serializes the entire read/check/write operation. Different members can run
 // concurrently, and failed operations release the queue for a fresh retry.
@@ -45,11 +64,10 @@ export class LocalLabelQueue {
   }
 
   #attempt(key, operation, attempt) {
-    const run = this.queue.run(key, operation).catch(() => {
-      if (attempt >= this.delays.length) {
-        console.error('ghost-guard: member labelling failed after all retries');
-        return undefined;
-      }
+    const run = this.queue.run(key, operation).catch((error) => {
+      if (isTerminal(error)) return logFailure(error, 'not retrying');
+      if (attempt >= this.delays.length) return logFailure(error, 'giving up after all retries');
+      logFailure(error, 'retrying');
       return new Promise((resolve) => {
         const timer = setTimeout(resolve, this.delays[attempt]);
         timer.unref?.();
@@ -74,7 +92,9 @@ export class MemberLabeller {
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
     const { id } = await request.json();
     if (typeof id !== 'string' || !/^[a-f\d]{24}$/.test(id)) return new Response('Invalid member ID', { status: 400 });
+    // A new delivery gets a fresh retry budget and runs now.
     await this.storage.put('id', id);
+    await this.storage.put('attempt', 0);
     await this.storage.setAlarm(Date.now());
     return json({ ok: true, queued: true }, 202);
   }
@@ -86,15 +106,18 @@ export class MemberLabeller {
       await labelCurrentMember(this.env, id);
       // A delivery that arrived mid-run has scheduled another pass; keep its state.
       if ((await this.storage.getAlarm()) === null) await this.storage.deleteAll();
-    } catch {
+    } catch (error) {
+      // A delivery that arrived mid-run has already scheduled a fresh pass.
+      if ((await this.storage.getAlarm()) !== null) return logFailure(error, 'a newer delivery will retry');
       const attempt = (await this.storage.get('attempt')) || 0;
-      if (attempt >= RETRY_DELAYS_MS.length) {
-        console.error('ghost-guard: member labelling failed after all retries');
+      if (isTerminal(error) || attempt >= RETRY_DELAYS_MS.length) {
+        logFailure(error, isTerminal(error) ? 'not retrying' : 'giving up after all retries');
         await this.storage.deleteAll();
         return;
       }
+      logFailure(error, 'retrying');
       await this.storage.put('attempt', attempt + 1);
-      if ((await this.storage.getAlarm()) === null) await this.storage.setAlarm(Date.now() + RETRY_DELAYS_MS[attempt]);
+      await this.storage.setAlarm(Date.now() + RETRY_DELAYS_MS[attempt]);
     }
   }
 }
@@ -109,6 +132,10 @@ export async function handleMemberAddedWebhook(request, env) {
   if (!env.ADMIN_API_URL || !env.ADMIN_API_KEY || !env.WEBHOOK_SECRET) {
     return json({ ok: false, error: 'admin api and webhook secret must be configured' }, 503);
   }
+  // Labelling runs after the 202, so report settings that can never work now,
+  // where Ghost Admin's webhook status shows them.
+  const configError = adminConfigError(env);
+  if (configError) return json({ ok: false, error: configError }, 503);
 
   const raw = await request.text();
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
@@ -148,6 +175,20 @@ export async function handleMemberAddedWebhook(request, env) {
   } catch {
     return json({ ok: false, error: 'member labelling could not be queued' }, 503);
   }
+}
+
+function adminConfigError(env) {
+  let url;
+  try {
+    url = new URL(env.ADMIN_API_URL);
+  } catch {
+    url = null;
+  }
+  if (!url || !['http:', 'https:'].includes(url.protocol)) return 'ADMIN_API_URL must be an http(s) URL';
+  if (!ADMIN_KEY_PATTERN.test(String(env.ADMIN_API_KEY).trim())) {
+    return "ADMIN_API_KEY must be the integration's id:secret Admin API key";
+  }
+  return null;
 }
 
 async function readCurrentMember(env, id) {
@@ -242,11 +283,13 @@ async function adminApiRequest(env, path, { method = 'GET', body } = {}) {
   return res.json();
 }
 
+// Ghost Admin API keys: a 24-hex-digit key ID and a 64-hex-digit secret.
+const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
+
 async function adminApiHeaders(adminApiKey) {
-  const [id, secret] = String(adminApiKey).split(':');
-  if (!id || !secret) {
-    throw new Error('ADMIN_API_KEY must be in id:secret form');
-  }
+  const apiKey = String(adminApiKey).trim();
+  if (!ADMIN_KEY_PATTERN.test(apiKey)) throw terminalError('ADMIN_API_KEY must be in id:secret form');
+  const [id, secret] = apiKey.split(':');
   const enc = new TextEncoder();
   const now = Math.floor(Date.now() / 1000);
   const header = btoa(JSON.stringify({ alg: 'HS256', kid: id, typ: 'JWT' }))

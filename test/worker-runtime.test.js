@@ -54,7 +54,7 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
     vars: {
       GHOST_ORIGIN: `http://127.0.0.1:${origin.address().port}`,
       CLEANUP_ENABLED: 'true', ADMIN_API_URL: `http://127.0.0.1:${origin.address().port}`,
-      ADMIN_API_KEY: 'id:0123456789abcdef', WEBHOOK_SECRET: 'webhook-secret',
+      ADMIN_API_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4), WEBHOOK_SECRET: 'webhook-secret',
     },
     experimental: { disableExperimentalWarning: true, disableDevRegistry: true, watch: false },
   });
