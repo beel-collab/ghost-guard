@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import worker from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
-import { MemberQueue } from '../src/webhook.js';
+import { LocalLabelQueue } from '../src/webhook.js';
 
 const script = await readFile(new URL('../public/ghost-guard/turnstile.js', import.meta.url), 'utf8');
 
@@ -21,7 +21,7 @@ export function createGuardServer(env = process.env) {
     ...env,
     GHOST_ORIGIN: (env.GHOST_ORIGIN || 'http://127.0.0.1:2368').replace(/\/+$/, ''),
     LOCAL_RATE_LIMITER: new MemoryRateLimiter(),
-    LOCAL_MEMBER_LABELLER: new MemberQueue(),
+    LOCAL_MEMBER_LABELLER: new LocalLabelQueue(),
     ASSETS: {
       fetch: async (request) => new Response(request.method === 'HEAD' ? null : script, {
         headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' },
@@ -47,9 +47,11 @@ export function createGuardServer(env = process.env) {
       for (const [key, value] of Object.entries(req.headers)) {
         if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value);
       }
-      // The immediate reverse proxy must overwrite X-Forwarded-For when trusted.
+      // Use the entry the trusted proxy added: the rightmost one. Proxies that
+      // append (nginx's $proxy_add_x_forwarded_for) keep client-sent values on
+      // the left; proxies that overwrite leave a single entry.
       const ip = env.TRUST_PROXY === 'true'
-        ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim()
+        ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',').at(-1).trim()
         : req.socket.remoteAddress;
       stripHopByHop(headers);
       headers.delete('content-length');

@@ -92,13 +92,29 @@ async function digest(value) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+// One subscriber line usually owns a whole IPv6 /64, so rotating addresses
+// inside it must not yield fresh quota. IPv4 (and IPv4-mapped IPv6) is keyed
+// by the full address.
+export function ipBucket(raw) {
+  const ip = String(raw).trim().toLowerCase().replace(/%.*$/, '');
+  const mapped = ip.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mapped) return mapped[1];
+  if (!ip.includes(':')) return ip;
+  const toGroups = (part) => (part ? part.split(':').flatMap((g) => (g.includes('.') ? ['0', '0'] : [g])) : []);
+  const [head, tail] = ip.split('::');
+  const left = toGroups(head);
+  const right = toGroups(tail);
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
+  return `${groups.slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':')}::/64`;
+}
+
 export async function checkSignupIpRateLimit(request, env) {
   const config = rateLimitConfig(env);
   // The sidecar overwrites this header using the socket (or an explicitly
   // trusted upstream); Workers receive it from Cloudflare, never X-Forwarded-For.
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   return consumeBuckets(request, env, [
-    { key: `ip:${await digest(ip)}`, limit: config.ipLimit, windowMs: config.ipWindowMs },
+    { key: `ip:${await digest(ipBucket(ip))}`, limit: config.ipLimit, windowMs: config.ipWindowMs },
   ]);
 }
 

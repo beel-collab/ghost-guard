@@ -2,14 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import worker from '../src/worker.js';
-import { MemberQueue, MemberLabeller } from '../src/webhook.js';
+import { MemberQueue, LocalLabelQueue, MemberLabeller, labelCurrentMember, RETRY_DELAYS_MS } from '../src/webhook.js';
 
 const memberId = '111111111111111111111111';
 const label = { id: '222222222222222222222222', name: 'signup-shield-review' };
 const env = {
   CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example',
   ADMIN_API_KEY: 'id:0123456789abcdef', WEBHOOK_SECRET: 'webhook-secret',
-  LOCAL_MEMBER_LABELLER: new MemberQueue(),
 };
 function event(member = { id: memberId, email: 'reader@work.example', status: 'free', labels: [] }) {
   const body = JSON.stringify({ member: { current: member } });
@@ -23,7 +22,7 @@ function ghost(t) {
   const state = {
     member: { id: memberId, email: 'reader@work.example', status: 'free', labels: [{ name: 'added-after-creation' }] },
     label: structuredClone(label), calls: [], beforeBulk: null, bulkResponse: null,
-    createConflict: false, readStatus: 200,
+    createConflict: false, readStatus: 200, readFailures: 0,
   };
   t.mock.method(globalThis, 'fetch', async (input, init = {}) => {
     const url = new URL(input);
@@ -32,6 +31,7 @@ function ghost(t) {
     state.calls.push({ url, method, body });
     assert.equal(url.origin, 'https://admin.example');
     if (url.pathname === `/ghost/api/admin/members/${memberId}/` && method === 'GET') {
+      if (state.readFailures > 0) { state.readFailures--; return Response.json({ errors: [] }, { status: 503 }); }
       if (state.readStatus !== 200) return Response.json({ errors: [] }, { status: state.readStatus });
       return state.member ? Response.json({ members: [structuredClone(state.member)] }) : new Response(null, { status: 404 });
     }
@@ -59,23 +59,20 @@ function ghost(t) {
   return state;
 }
 
-test('delayed webhook only adds the review label and preserves current and concurrently added labels', async (t) => {
+const label_ = (overrides = {}) => labelCurrentMember({ ...env, ...overrides }, memberId);
+
+test('labelling only adds the review label and preserves current and concurrently added labels', async (t) => {
   const state = ghost(t);
   state.beforeBulk = () => state.member.labels.push({ name: 'added-during-delivery' });
-  const response = await worker.fetch(event(), { ...env, CLEANUP_MODE: 'unsubscribe' });
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).action, 'label');
+  assert.equal((await label_({ CLEANUP_MODE: 'unsubscribe' })).action, 'label');
   assert.deepEqual(state.member.labels.map((item) => item.name), ['added-after-creation', 'added-during-delivery', 'signup-shield-review']);
   assert.ok(state.calls.filter((call) => call.method !== 'GET').every((call) => call.url.pathname.endsWith('/members/bulk/')));
 });
 
-test('replayed events are idempotent and do not restore labels removed since creation', async (t) => {
+test('repeated labelling is idempotent and does not restore labels removed since creation', async (t) => {
   const state = ghost(t);
-  const snapshot = { id: memberId, email: 'reader@work.example', status: 'free', labels: [{ name: 'removed-since-creation' }] };
-  assert.equal((await worker.fetch(event(snapshot), env)).status, 200);
-  const replay = await worker.fetch(event(snapshot), env);
-  assert.equal(replay.status, 200);
-  assert.equal((await replay.json()).skipped, 'already-labelled');
+  await label_();
+  assert.equal((await label_()).skipped, 'already-labelled');
   assert.deepEqual(state.member.labels.map((item) => item.name), ['added-after-creation', label.name]);
   assert.equal(state.calls.filter((call) => call.method === 'PUT').length, 1);
 });
@@ -84,7 +81,7 @@ test('labeller creates the fixed label when missing, including a concurrent crea
   const state = ghost(t);
   state.label = null;
   state.createConflict = true;
-  assert.equal((await worker.fetch(event(), env)).status, 200);
+  await label_();
   assert.ok(state.member.labels.some((item) => item.name === label.name));
   assert.equal(state.calls.filter((call) => call.method === 'POST').length, 1);
 });
@@ -93,8 +90,7 @@ for (const status of ['paid', 'comped', 'gift']) {
   test(`stale free-member events cannot label a currently ${status} member`, async (t) => {
     const state = ghost(t);
     state.member.status = status;
-    const response = await worker.fetch(event(), env);
-    assert.equal((await response.json()).skipped, 'not-free');
+    assert.equal((await label_()).skipped, 'not-free');
     assert.equal(state.calls.length, 1);
   });
 }
@@ -102,51 +98,56 @@ for (const status of ['paid', 'comped', 'gift']) {
 test('eligibility uses the current email domain', async (t) => {
   const state = ghost(t);
   state.member.email = 'reader@gmail.com';
-  const response = await worker.fetch(event(), { ...env, CLEANUP_SKIP_DOMAINS: 'gmail.com' });
-  assert.equal((await response.json()).skipped, 'consumer-domain');
+  assert.equal((await label_({ CLEANUP_SKIP_DOMAINS: 'gmail.com' })).skipped, 'consumer-domain');
   assert.equal(state.calls.length, 1);
 });
 
 test('members deleted after the event are skipped', async (t) => {
   const state = ghost(t);
   state.member = null;
-  assert.equal((await (await worker.fetch(event(), env)).json()).skipped, 'member-missing');
+  assert.equal((await label_()).skipped, 'member-missing');
   assert.equal(state.calls.length, 1);
 });
 
 test('bulk filter rechecks free status at write time', async (t) => {
   const state = ghost(t);
   state.beforeBulk = () => { state.member.status = 'paid'; };
-  assert.equal((await (await worker.fetch(event(), env)).json()).skipped, 'not-free');
+  assert.equal((await label_()).skipped, 'not-free');
   assert.deepEqual(state.member.labels.map((item) => item.name), ['added-after-creation']);
 });
 
-test('concurrent duplicate delivery is accepted only after observing the applied label', async (t) => {
+test('an HTTP 200 bulk failure is accepted only after observing the applied label', async (t) => {
   const state = ghost(t);
   state.beforeBulk = () => state.member.labels.push(structuredClone(label));
   state.bulkResponse = { bulk: { meta: { stats: { successful: 0, unsuccessful: 1 } } } };
-  const response = await worker.fetch(event(), env);
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).skipped, 'already-labelled');
+  assert.equal((await label_()).skipped, 'already-labelled');
 });
 
-test('HTTP 200 bulk failures are retryable when the label was not applied', async (t) => {
+test('HTTP 200 bulk failures throw when the label was not applied', async (t) => {
   const state = ghost(t);
   state.bulkResponse = { bulk: { meta: { stats: { successful: 0, unsuccessful: 1 } } } };
-  assert.equal((await worker.fetch(event(), env)).status, 503);
+  await assert.rejects(label_());
   assert.deepEqual(state.member.labels.map((item) => item.name), ['added-after-creation']);
 });
 
-test('Admin API outages are retryable without writing labels', async (t) => {
+test('Admin API outages throw without writing labels', async (t) => {
   const state = ghost(t);
   state.readStatus = 503;
-  assert.equal((await worker.fetch(event(), env)).status, 503);
+  await assert.rejects(label_());
   assert.equal(state.calls.length, 1);
 });
 
 test('invalid event IDs cannot broaden the additive member filter', async (t) => {
   const state = ghost(t);
-  assert.equal((await worker.fetch(event({ id: "x'+status:free" }), env)).status, 400);
+  const queue = new LocalLabelQueue([]);
+  assert.equal((await worker.fetch(event({ id: "x'+status:free" }), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 400);
+  await queue.idle();
+  assert.equal(state.calls.length, 0);
+});
+
+test('missing Worker labeller binding fails closed', async (t) => {
+  const state = ghost(t);
+  assert.equal((await worker.fetch(event(), env)).status, 503);
   assert.equal(state.calls.length, 0);
 });
 
@@ -156,57 +157,59 @@ function deferred() {
   return { promise, resolve };
 }
 
-for (const storage of ['sidecar', 'durable']) {
-  test(`${storage}: overlapping deliveries serialize the fresh read and unconditional insert`, { timeout: 3000 }, async (t) => {
-    const state = ghost(t);
-    const enteredBulk = deferred();
-    const releaseBulk = deferred();
-    const secondQueued = deferred();
-    let accepted = 0;
-    class ObservedQueue extends MemberQueue {
-      run(key, operation) {
-        if (++accepted === 2) secondQueued.resolve();
-        return super.run(key, operation);
-      }
-    }
-    const queue = new ObservedQueue();
-    let config;
-    if (storage === 'sidecar') {
-      config = { ...env, LOCAL_MEMBER_LABELLER: queue };
-    } else {
-      const object = new MemberLabeller(null, env);
-      object.queue = queue;
-      config = { ...env, LOCAL_MEMBER_LABELLER: undefined, MEMBER_LABELLER: {
-        idFromName(key) { assert.equal(key, `https://admin.example:${memberId}`); return key; },
-        get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
-      } };
-    }
-    state.beforeBulk = async () => { enteredBulk.resolve(); await releaseBulk.promise; };
-    t.after(() => releaseBulk.resolve());
-    const first = worker.fetch(event(), { ...config });
-    await enteredBulk.promise;
-    const second = worker.fetch(event(), { ...config });
-    await secondQueued.promise;
-    assert.equal(state.calls.filter((call) => call.url.pathname.endsWith(`/members/${memberId}/`)).length, 1);
-    releaseBulk.resolve();
-    const responses = await Promise.all([first, second]);
-    assert.deepEqual(responses.map((response) => response.status), [200, 200]);
-    assert.equal((await responses[1].json()).skipped, 'already-labelled');
-    assert.equal(state.calls.filter((call) => call.method === 'PUT').length, 1);
-    assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
-    assert.equal(queue.pending.size, 0);
-  });
-}
+// Sidecar delivery: acknowledged at once, labelled in the background.
 
-test('a failed delivery releases its member queue so retry can complete', async (t) => {
+test('sidecar acknowledges within Ghost\'s timeout and labels in the background', async (t) => {
   const state = ghost(t);
-  const queue = new MemberQueue();
-  const config = { ...env, LOCAL_MEMBER_LABELLER: queue };
+  const release = deferred();
+  state.beforeBulk = () => release.promise;
+  const queue = new LocalLabelQueue([]);
+  const response = await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue });
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { ok: true, queued: true });
+  assert.equal(state.member.labels.some((item) => item.name === label.name), false);
+  release.resolve();
+  await queue.idle();
+  assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
+});
+
+test('sidecar retries a failed labelling until it succeeds', async (t) => {
+  const state = ghost(t);
+  state.readFailures = 2;
+  const queue = new LocalLabelQueue([0, 0, 0]);
+  assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 202);
+  await queue.idle();
+  assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
+  assert.equal(queue.queue.pending.size, 0);
+});
+
+test('sidecar gives up after the retry schedule and logs without the member data', async (t) => {
+  const state = ghost(t);
   state.readStatus = 503;
-  assert.equal((await worker.fetch(event(), config)).status, 503);
-  assert.equal(queue.pending.size, 0);
-  state.readStatus = 200;
-  assert.equal((await worker.fetch(event(), config)).status, 200);
+  const errors = t.mock.method(console, 'error', () => {});
+  const queue = new LocalLabelQueue([0, 0]);
+  assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: queue })).status, 202);
+  await queue.idle();
+  assert.equal(state.calls.length, 3);
+  assert.equal(errors.mock.callCount(), 1);
+  assert.doesNotMatch(String(errors.mock.calls[0].arguments), /reader@|1111/);
+});
+
+test('sidecar overlapping deliveries serialize the fresh read and unconditional insert', { timeout: 3000 }, async (t) => {
+  const state = ghost(t);
+  const enteredBulk = deferred();
+  const releaseBulk = deferred();
+  state.beforeBulk = async () => { enteredBulk.resolve(); await releaseBulk.promise; };
+  t.after(() => releaseBulk.resolve());
+  const queue = new LocalLabelQueue([]);
+  const config = { ...env, LOCAL_MEMBER_LABELLER: queue };
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  await enteredBulk.promise;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  assert.equal(state.calls.filter((call) => call.url.pathname.endsWith(`/members/${memberId}/`)).length, 1);
+  releaseBulk.resolve();
+  await queue.idle();
+  assert.equal(state.calls.filter((call) => call.method === 'PUT').length, 1);
   assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
 });
 
@@ -225,8 +228,84 @@ test('the queue allows different members to proceed independently', async () => 
   assert.equal(queue.pending.size, 0);
 });
 
-test('missing Worker labeller binding fails closed', async (t) => {
+// Worker delivery: the Durable Object stores the member and labels from its alarm.
+
+function durable() {
+  const data = new Map();
+  const storage = {
+    data, alarm: null,
+    async get(key) { return data.get(key); },
+    async put(key, value) { data.set(key, value); },
+    async deleteAll() { data.clear(); },
+    async getAlarm() { return storage.alarm; },
+    async setAlarm(time) { storage.alarm = time; },
+  };
+  const object = new MemberLabeller({ storage }, env);
+  // The runtime clears the alarm before invoking the handler.
+  const fire = () => { storage.alarm = null; return object.alarm(); };
+  const config = { ...env, MEMBER_LABELLER: {
+    idFromName(key) { assert.equal(key, `https://admin.example:${memberId}`); return key; },
+    get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
+  } };
+  return { storage, fire, config };
+}
+
+test('Worker acknowledges at once and labels from the Durable Object alarm', async (t) => {
   const state = ghost(t);
-  assert.equal((await worker.fetch(event(), { ...env, LOCAL_MEMBER_LABELLER: undefined })).status, 503);
+  const { storage, fire, config } = durable();
+  const responses = await Promise.all([worker.fetch(event(), config), worker.fetch(event(), config)]);
+  assert.deepEqual(responses.map((response) => response.status), [202, 202]);
   assert.equal(state.calls.length, 0);
+  assert.ok(storage.alarm <= Date.now());
+  await fire();
+  assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
+  assert.equal(storage.data.size, 0);
+  assert.equal(storage.alarm, null);
+});
+
+test('Worker retries failed labelling on the backoff schedule', async (t) => {
+  const state = ghost(t);
+  const { storage, fire, config } = durable();
+  state.readStatus = 503;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  const before = Date.now();
+  await fire();
+  assert.equal(storage.data.get('attempt'), 1);
+  assert.ok(storage.alarm >= before + RETRY_DELAYS_MS[0]);
+  state.readStatus = 200;
+  await fire();
+  assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
+  assert.equal(storage.data.size, 0);
+});
+
+test('Worker keeps a delivery that arrives while a retry is pending or a run is in progress', async (t) => {
+  const state = ghost(t);
+  const { storage, fire, config } = durable();
+  state.readStatus = 503;
+  await worker.fetch(event(), config);
+  await fire();
+  // A new delivery brings the pending retry forward.
+  await worker.fetch(event(), config);
+  assert.ok(storage.alarm <= Date.now());
+  state.readStatus = 200;
+  state.beforeBulk = () => worker.fetch(event(), config);
+  await fire();
+  // The mid-run delivery scheduled another pass, so state is kept for it.
+  assert.notEqual(storage.alarm, null);
+  await fire();
+  assert.equal(state.calls.filter((call) => call.method === 'PUT').length, 1);
+  assert.equal(storage.data.size, 0);
+});
+
+test('Worker gives up after the retry schedule', async (t) => {
+  const state = ghost(t);
+  const { storage, fire, config } = durable();
+  state.readStatus = 503;
+  const errors = t.mock.method(console, 'error', () => {});
+  await worker.fetch(event(), config);
+  for (let i = 0; i <= RETRY_DELAYS_MS.length; i++) await fire();
+  assert.equal(state.calls.length, RETRY_DELAYS_MS.length + 1);
+  assert.equal(errors.mock.callCount(), 1);
+  assert.equal(storage.data.size, 0);
+  assert.equal(storage.alarm, null);
 });

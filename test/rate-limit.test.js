@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { MemoryRateLimiter, SignupRateLimiter, checkSignupIpRateLimit, checkSignupEmailRateLimit, rateLimitConfig } from '../src/rate-limit.js';
+import { MemoryRateLimiter, SignupRateLimiter, checkSignupIpRateLimit, checkSignupEmailRateLimit, rateLimitConfig, ipBucket } from '../src/rate-limit.js';
 
 // Run the DO's real SQL against SQLite; the Worker integration smoke test uses
 // Wrangler's actual Durable Object runtime as well.
@@ -98,4 +98,23 @@ test('invalid configuration falls back to safe defaults', () => {
   assert.deepEqual(rateLimitConfig({ SIGNUP_IP_LIMIT: '0', SIGNUP_EMAIL_LIMIT: '-1', SIGNUP_IP_WINDOW_SECONDS: 'oops' }), {
     ipLimit: 5, emailLimit: 3, ipWindowMs: 3600000, emailWindowMs: 86400000,
   });
+});
+
+test('IPv6 addresses share one quota per /64; IPv4 and IPv4-mapped addresses stay exact', async () => {
+  assert.equal(ipBucket('2001:db8:1:2::1'), '2001:db8:1:2::/64');
+  assert.equal(ipBucket('2001:0DB8:0001:0002:ffff:1:2:3'), '2001:db8:1:2::/64');
+  assert.equal(ipBucket('2001:db8::1'), '2001:db8:0:0::/64');
+  assert.equal(ipBucket('fe80::1%eth0'), 'fe80:0:0:0::/64');
+  assert.equal(ipBucket('64:ff9b:1:2::192.0.2.1'), '64:ff9b:1:2::/64');
+  assert.equal(ipBucket('::1'), '0:0:0:0::/64');
+  assert.equal(ipBucket('::ffff:192.0.2.1'), '192.0.2.1');
+  assert.equal(ipBucket('192.0.2.1'), '192.0.2.1');
+  assert.notEqual(ipBucket('2001:db8:1:2::1'), ipBucket('2001:db8:1:3::1'));
+
+  const env = { LOCAL_RATE_LIMITER: new MemoryRateLimiter(), SIGNUP_IP_LIMIT: '2' };
+  const from = (ip) => new Request('https://blog.example/', { headers: { 'CF-Connecting-IP': ip } });
+  assert.equal((await checkSignupIpRateLimit(from('2001:db8:1:2::a'), env)).allowed, true);
+  assert.equal((await checkSignupIpRateLimit(from('2001:db8:1:2:dead:beef:0:1'), env)).allowed, true);
+  assert.equal((await checkSignupIpRateLimit(from('2001:db8:1:2::ffff'), env)).allowed, false);
+  assert.equal((await checkSignupIpRateLimit(from('2001:db8:1:3::a'), env)).allowed, true);
 });

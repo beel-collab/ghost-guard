@@ -51,6 +51,14 @@ test('trusted proxy mode honors the explicitly overwritten X-Forwarded-For', asy
   assert.equal((await send(guard, { email: 'third@work.example' }, { 'X-Forwarded-For': '192.0.2.1' })).status, 429);
 });
 
+test('trusted proxy mode uses the entry the proxy appended, not client-sent ones', async (t) => {
+  const { guard, calls } = await setup(t, { SIGNUP_IP_LIMIT: '1', TRUST_PROXY: 'true' });
+  // nginx $proxy_add_x_forwarded_for appends the real peer after client values.
+  assert.equal((await send(guard, {}, { 'X-Forwarded-For': '203.0.113.1, 192.0.2.1' })).status, 201);
+  assert.equal(calls[0].headers['x-forwarded-for'], '192.0.2.1');
+  assert.equal((await send(guard, { email: 'other@work.example' }, { 'X-Forwarded-For': '203.0.113.2, 192.0.2.1' })).status, 429);
+});
+
 test('sidecar verifies signup tokens through the shared handler, including its trusted hostname and action', async (t) => {
   const originalFetch = globalThis.fetch;
   let verificationCount = 0;

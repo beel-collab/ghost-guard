@@ -85,10 +85,12 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
   const deliveries = await Promise.all(Array.from({ length: 10 }, () => dev.fetch('/signup-shield/webhooks/member-added', {
     method: 'POST', body, headers: { 'X-Ghost-Signature': `sha256=${hash}, t=${timestamp}` },
   })));
-  assert.ok(deliveries.every((response) => response.status === 200));
-  const results = await Promise.all(deliveries.map((response) => response.json()));
-  assert.equal(results.filter((result) => result.action === 'label').length, 1);
-  assert.equal(results.filter((result) => result.skipped === 'already-labelled').length, 9);
+  // Ghost's 2 s webhook timeout: deliveries are acknowledged before labelling.
+  assert.ok(deliveries.every((response) => response.status === 202));
+  const deadline = Date.now() + 10000;
+  while (labelWrites === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  // Allow any extra alarm pass triggered by overlapping deliveries to finish.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   assert.equal(labelWrites, 1);
   assert.equal(labels.length, 1);
 });

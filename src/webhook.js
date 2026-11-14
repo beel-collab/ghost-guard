@@ -1,6 +1,11 @@
 /** Authenticated, additive member labelling shared by Worker and sidecar. */
 const REVIEW_LABEL = 'signup-shield-review';
 
+// Ghost sends each webhook once: a POST with a 2 s timeout that is not retried.
+// Handlers therefore acknowledge immediately and label in the background,
+// retrying on this schedule (about 3.5 hours in total).
+export const RETRY_DELAYS_MS = [30e3, 60e3, 120e3, 300e3, 900e3, 1800e3, 3600e3, 3600e3];
+
 // Serializes the entire read/check/write operation. Different members can run
 // concurrently, and failed operations release the queue for a fresh retry.
 export class MemberQueue {
@@ -21,22 +26,75 @@ export class MemberQueue {
   }
 }
 
-// The namespace routes all Worker instances for one Ghost/member to the same
-// object. Queue across async Admin API calls, not just the initial HTTP read.
-export class MemberLabeller {
-  constructor(_ctx, env) {
-    this.env = env;
+// Sidecar: per-member serialization plus in-process retries. Pending retries
+// are lost if the process restarts.
+export class LocalLabelQueue {
+  constructor(delays = RETRY_DELAYS_MS) {
     this.queue = new MemberQueue();
+    this.delays = delays;
+    this.inflight = new Set();
+  }
+
+  enqueue(key, operation) {
+    this.#attempt(key, operation, 0);
+  }
+
+  // Resolves once every queued label and scheduled retry has finished.
+  async idle() {
+    while (this.inflight.size) await Promise.all([...this.inflight]);
+  }
+
+  #attempt(key, operation, attempt) {
+    const run = this.queue.run(key, operation).catch(() => {
+      if (attempt >= this.delays.length) {
+        console.error('ghost-guard: member labelling failed after all retries');
+        return undefined;
+      }
+      return new Promise((resolve) => {
+        const timer = setTimeout(resolve, this.delays[attempt]);
+        timer.unref?.();
+      }).then(() => this.#attempt(key, operation, attempt + 1));
+    });
+    const tracked = run.finally(() => this.inflight.delete(tracked));
+    this.inflight.add(tracked);
+    return tracked;
+  }
+}
+
+// Worker: one object per Ghost site and member. The fetch handler records the
+// member and schedules an alarm; the runtime runs at most one alarm per object
+// at a time, which serializes the read/check/write across deliveries.
+export class MemberLabeller {
+  constructor(ctx, env) {
+    this.storage = ctx.storage;
+    this.env = env;
   }
 
   async fetch(request) {
     if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
     const { id } = await request.json();
     if (typeof id !== 'string' || !/^[a-f\d]{24}$/.test(id)) return new Response('Invalid member ID', { status: 400 });
+    await this.storage.put('id', id);
+    await this.storage.setAlarm(Date.now());
+    return json({ ok: true, queued: true }, 202);
+  }
+
+  async alarm() {
+    const id = await this.storage.get('id');
+    if (!id) return;
     try {
-      return await this.queue.run(id, () => labelCurrentMember(this.env, id));
+      await labelCurrentMember(this.env, id);
+      // A delivery that arrived mid-run has scheduled another pass; keep its state.
+      if ((await this.storage.getAlarm()) === null) await this.storage.deleteAll();
     } catch {
-      return json({ ok: false, error: 'member labelling failed; please retry' }, 503);
+      const attempt = (await this.storage.get('attempt')) || 0;
+      if (attempt >= RETRY_DELAYS_MS.length) {
+        console.error('ghost-guard: member labelling failed after all retries');
+        await this.storage.deleteAll();
+        return;
+      }
+      await this.storage.put('attempt', attempt + 1);
+      if ((await this.storage.getAlarm()) === null) await this.storage.setAlarm(Date.now() + RETRY_DELAYS_MS[attempt]);
     }
   }
 }
@@ -79,7 +137,8 @@ export async function handleMemberAddedWebhook(request, env) {
     const id = member.id.toLowerCase();
     const key = `${new URL(env.ADMIN_API_URL).href.replace(/\/+$/, '')}:${id}`;
     if (env.LOCAL_MEMBER_LABELLER) {
-      return await env.LOCAL_MEMBER_LABELLER.run(key, () => labelCurrentMember(env, id));
+      env.LOCAL_MEMBER_LABELLER.enqueue(key, () => labelCurrentMember(env, id));
+      return json({ ok: true, queued: true }, 202);
     }
     if (!env.MEMBER_LABELLER) throw new Error('MEMBER_LABELLER binding is required');
     const objectId = env.MEMBER_LABELLER.idFromName(key);
@@ -87,9 +146,7 @@ export async function handleMemberAddedWebhook(request, env) {
       method: 'POST', body: JSON.stringify({ id }),
     });
   } catch {
-    // A non-2xx response makes delivery failures retryable; never acknowledge a
-    // failed or partially successful Admin API operation as completed.
-    return json({ ok: false, error: 'member labelling failed; please retry' }, 503);
+    return json({ ok: false, error: 'member labelling could not be queued' }, 503);
   }
 }
 
@@ -105,13 +162,14 @@ async function readCurrentMember(env, id) {
   }
 }
 
-async function labelCurrentMember(env, id) {
+// Returns the outcome; throws when the label may not have been applied.
+export async function labelCurrentMember(env, id) {
   // The event is a creation-time snapshot. Eligibility and replay detection
   // must use current state, and label writes must be additive.
   const member = await readCurrentMember(env, id);
-  if (!member) return json({ ok: true, skipped: 'member-missing' });
+  if (!member) return { ok: true, skipped: 'member-missing' };
   if (member.status !== 'free') {
-    return json({ ok: true, skipped: 'not-free' });
+    return { ok: true, skipped: 'not-free' };
   }
 
   const domain = String(member.email).split('@')[1]?.toLowerCase() || '';
@@ -122,24 +180,24 @@ async function labelCurrentMember(env, id) {
       .filter(Boolean),
   );
   if (skip.has(domain)) {
-    return json({ ok: true, skipped: 'consumer-domain' });
+    return { ok: true, skipped: 'consumer-domain' };
   }
 
-  if (hasReviewLabel(member)) return json({ ok: true, skipped: 'already-labelled', id });
+  if (hasReviewLabel(member)) return { ok: true, skipped: 'already-labelled', id };
   const label = await getReviewLabel(env);
   const query = new URLSearchParams({ filter: `id:'${id}'+status:free` });
   const result = await adminApiRequest(env, `members/bulk/?${query}`, {
     method: 'PUT', body: { bulk: { action: 'addLabel', meta: { label: { id: label.id } } } },
   });
   const stats = result.bulk?.meta?.stats;
-  if (stats?.successful === 1 && stats.unsuccessful === 0) return json({ ok: true, action: 'label', id });
+  if (stats?.successful === 1 && stats.unsuccessful === 0) return { ok: true, action: 'label', id };
 
-  // Concurrent deliveries may both try to add the same relation. Ghost reports
-  // bulk failures inside HTTP 200; only accept them if the label is now present.
+  // Ghost reports bulk failures inside HTTP 200, for example when another
+  // writer added the same label first. Accept only if the label is now present.
   const current = await readCurrentMember(env, id);
-  if (!current) return json({ ok: true, skipped: 'member-missing' });
-  if (current.status !== 'free') return json({ ok: true, skipped: 'not-free' });
-  if (hasReviewLabel(current)) return json({ ok: true, skipped: 'already-labelled', id });
+  if (!current) return { ok: true, skipped: 'member-missing' };
+  if (current.status !== 'free') return { ok: true, skipped: 'not-free' };
+  if (hasReviewLabel(current)) return { ok: true, skipped: 'already-labelled', id };
   throw new Error('Ghost did not apply the review label');
 }
 
