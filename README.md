@@ -1,91 +1,86 @@
 # ghost-guard
 
-Stop Ghost signup spam that shows up as **real members with corporate email addresses**.
+Protect a self-hosted Ghost publication against two stages of signup abuse:
 
-Those accounts are created because Ghost confirms a signup on a **plain GET** of the magic link. Corporate mail scanners prefetch that link. This package puts a **click-to-confirm page** in front of that GET, so a scanner visit no longer creates the member.
+1. **Before an email is sent:** intercept signup requests to `/members/api/send-magic-link/`, verify an optional Turnstile challenge server-side, and enforce IP and email quotas.
+2. **Before a member is created:** show a **Confirm signup** button when a signup magic link is opened. A scanner's GET/HEAD never reaches Ghost; only the form POST forwards the confirmation GET to Ghost.
 
-Ghost has **no official plugin system**. The most plugin-like, easy install depends on how you host:
+The confirmation page has no JavaScript, auto-submit, or Turnstile widget. Explicit sign-in requests (`emailType: "signin"`) and sign-in magic links pass through unchanged. Both trailing-slash variants of the signup API are protected. Ghost defaults a missing `emailType` to `subscribe`, so omitted and unknown types receive signup protection too.
 
-| Hosting | Easiest install | What it does |
-| --- | --- | --- |
-| Self-hosted, DNS already on Cloudflare | **Deploy the Worker**, add one route | Interstitial. This is the real fix. |
-| Self-hosted, no Cloudflare | **Docker sidecar** in front of Ghost | Same interstitial, no CF account. |
-| Ghost(Pro) | **Webhook cleanup** on the same Worker | Labels (or unsubscribes) new corporate-domain members. Does *not* stop creation. A confirmation interstitial is not officially possible on Ghost(Pro) — see below. |
+Ghost has no official plugin system. This is a proxy prototype, not an official Ghost plugin. It has automated tests but has not been deployed against a production Ghost site.
 
-This repository is a prototype. It has not been published or deployed.
+| Hosting | Deployment |
+| --- | --- |
+| Self-hosted with Cloudflare proxy | Cloudflare Worker with a SQLite-backed Durable Object |
+| Self-hosted without Cloudflare proxy | Node 22.16+ sidecar, optionally Docker |
+| Ghost(Pro) | Webhook labeller only; see the Ghost(Pro) note below |
 
-## Why a click is required
+## Self-hosted: Cloudflare Worker
 
-Ghost’s signup email points at:
-
-```
-https://yourdomain.com/members/?token=…&action=signup
-```
-
-A GET of that URL creates the member, sets a session cookie, and redirects. There is no human step. Mail scanners do that GET automatically. Ghost already allows the token to be reused for 10 minutes after the first hit (up to 7 uses, 24-hour lifetime) so Outlook Safe Links do not break the real user’s click — but the first scanner GET has already created the member.
-
-This tool serves an HTML form on that GET and only forwards the request to Ghost after the form is POSTed. There is **no auto-submit JavaScript**; many scanners run JS.
-
-A CAPTCHA on the signup *form* is useful against bots that submit addresses, but it does not stop a scanner confirming an email that was already sent.
-
-## Install: self-hosted on Cloudflare (recommended)
-
-You need: a Cloudflare account (free plan is enough) and the Ghost hostname already proxied (orange cloud).
-
-### 1. Deploy the Worker
-
-When this repo is on GitHub, the one-click path is:
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/beel-collab/ghost-guard)
-
-Until then, from a checkout:
+Your Ghost hostname must already be proxied by Cloudflare. From this checkout:
 
 ```bash
-npm install
+npm ci
 npx wrangler login
-npx wrangler secret put CONFIRM_SECRET   # any long random string
+npx wrangler secret put CONFIRM_SECRET
+npx wrangler secret put GHOST_ORIGIN
 npx wrangler deploy
 ```
 
-Optional:
+Use a long random `CONFIRM_SECRET`. Set `GHOST_ORIGIN` to a direct, DNS-only Ghost origin such as `https://origin.example.com`. The confirmation request includes the secret as `X-Ghost-Signup-Shield` to avoid intercepting its own follow-up request. A direct origin is recommended; without one the Worker uses same-zone forwarding. Restrict direct origin access to your proxy so attackers cannot bypass it.
+
+`wrangler.toml` includes the static asset binding, Durable Object binding, and first SQLite migration. There is no KV namespace to create. Set `SITE_TITLE` and quotas in `[vars]` before deploying.
+
+In Cloudflare **Workers & Pages → ghost-guard → Settings/Triggers → Routes**, attach:
+
+```text
+example.com/members*
+example.com/ghost-guard/*
+```
+
+The first route covers **both** the signup API and email confirmation links. The second serves the Code Injection script. Add `example.com/signup-shield/*` only if using the optional webhook. Leave the rest of the site unrouted.
+
+### Enable Turnstile on signup requests
+
+1. Create a **Managed** Turnstile widget in Cloudflare, allowing your public Ghost hostname.
+2. Set the widget's secret with `npx wrangler secret put TURNSTILE_SECRET`.
+3. In **Ghost Admin → Settings → Advanced → Code injection → Site Header**, paste this, replacing the public sitekey:
+
+```html
+<script src="/ghost-guard/turnstile.js" data-sitekey="YOUR_PUBLIC_TURNSTILE_SITE_KEY"></script>
+```
+
+Save, then reload the public site before testing. Use Site Header, not an individual post's injection. Do not add `async` to this snippet. The Worker and sidecar both serve this URL. The public key is only in the snippet; `TURNSTILE_SITE_KEY` is no longer a server setting.
+
+The script wraps `window.fetch` only for POSTs to this same site's `/members/api/send-magic-link/`. Portal's API calls execute in the main page even though its UI uses frames. Explicit sign-in and unrelated requests keep their original arguments. Every signup gets a fresh token from a managed widget; it stays unobtrusive unless Cloudflare requires interaction, and is removed after completion. Script/challenge failures return a Portal-readable JSON error without sending the signup request. Custom fetch-based forms on the same site work too; forms using XHR or normal HTML submission need their own token integration. Cross-origin Portal embeds are outside this snippet's scope.
+
+For a custom client, send the token either as the `cf-turnstile-response` header or as a JSON field of that name. The server calls `https://challenges.cloudflare.com/turnstile/v0/siteverify` and checks success, hostname, and action `ghost_signup`. The expected hostname defaults to the incoming request hostname; use `TURNSTILE_HOSTNAME` if your public signup hostname differs. Tokens are removed before forwarding to Ghost. Missing, rejected, expired, reused, or unverifiable tokens yield HTTP 400:
+
+```json
+{"errors":[{"message":"Unable to verify your request, please try again","type":"ValidationError"}]}
+```
+
+**Turnstile is optional:** if `TURNSTILE_SECRET` is unset, token verification is skipped. Quotas and the click-to-confirm page remain active. To disable it cleanly, remove the Code Injection snippet as well. Configure the snippet and secret together. A widget alone is insufficient; see [Cloudflare's server validation requirements](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
+
+### Rate limits and storage
+
+Defaults are **5 signup requests per IP per hour** and **3 per email address per 24 hours**. These are independent windows anchored to the first allowed attempt. Email keys trim whitespace and ignore case; provider-specific aliases are not merged. Sign-in requests and confirmation clicks do not count.
+
+When Turnstile is enabled, only requests passing verification consume quotas. This prevents invalid challenges from exhausting another reader's email quota. When disabled, every well-formed signup request counts. An allowed attempt consumes quota even if Ghost subsequently fails; blocked attempts do not consume either quota or extend the windows.
+
+Exceeding either quota returns HTTP **429** with Ghost-compatible `errors[].message` JSON and a **Retry-After** header in seconds. The retry time covers every currently exceeded quota.
+
+The Worker uses **one SQLite-backed Durable Object per publication origin**, with both counters reserved in a single synchronous transaction. This keeps limits consistent across Worker instances and concurrent requests. KV's eventual consistency would allow quota overruns, which is why it is not used. Counter keys contain SHA-256 digests rather than plaintext IP/email values. An hourly alarm removes expired rows; expiry is also checked on each access. Missing/unavailable storage fails closed with 503. A single object is deliberately simple for publication signup traffic; very high traffic may need a different sharding design.
+
+The sidecar uses the same quota algorithm with an **in-memory, per-process store**. Restarts reset quotas and multiple processes/replicas do not share them. Expired entries are swept during activity. Use one process or the Worker deployment if you need a shared durable limit.
+
+## Self-hosted: Node / Docker sidecar
 
 ```bash
-npx wrangler secret put GHOST_ORIGIN     # https://origin.yourdomain.com (DNS-only / direct to Ghost)
-npx wrangler secret put TURNSTILE_SECRET # only if you also set TURNSTILE_SITE_KEY
-```
-
-Set `SITE_TITLE` and, if you use Turnstile, `TURNSTILE_SITE_KEY` in `wrangler.toml` or the dashboard.
-
-`CONFIRM_SECRET` is sent as the `X-Ghost-Signup-Shield` header when the Worker forwards a confirmed click to Ghost, so the Worker does not intercept its own follow-up request. Prefer also setting `GHOST_ORIGIN` to a DNS-only hostname that points at Ghost, to avoid any routing loop.
-
-### 2. Attach one route
-
-In Cloudflare: **Workers & Pages → ghost-guard → Triggers → Add route**
-
-```
-yourdomain.com/members*
-```
-
-Leave the rest of the site unrouted. The Worker only changes signup/subscribe/signup-paid magic links under `/members`. Sign-in links (`action=signin`) pass through unchanged.
-
-### 3. Check it
-
-1. Sign up with an address you control.
-2. Open the confirmation link in a private window, or `curl -I 'https://yourdomain.com/members/?token=…&action=signup'`.
-3. You should get an HTML page, **not** a 302, and **no new member** in Ghost Admin yet.
-4. Click **Confirm signup**. You should be signed in and the member should appear.
-
-If legitimate signups 404 or loop, the route or `GHOST_ORIGIN` is wrong. Remove the route to roll back instantly.
-
-## Install: self-hosted without Cloudflare (Docker sidecar)
-
-Point your TLS terminator or nginx at this proxy, or proxy only `/members` to it.
-
-```bash
-# from the repo root
 export GHOST_ORIGIN=http://127.0.0.1:2368
 export SITE_TITLE="My Publication"
-node sidecar/server.mjs
+# Optional: export TURNSTILE_SECRET="your-widget-secret"
+npm run sidecar
 ```
 
 Or:
@@ -94,81 +89,112 @@ Or:
 docker compose -f sidecar/docker-compose.yml up --build
 ```
 
-Edit `GHOST_ORIGIN` in the compose file so it can reach Ghost on the same Docker network. Then, in nginx / Caddy, send `/members` to `http://signup-shield:8787` and everything else to Ghost as today.
+Attach the container to Ghost's Docker network and adjust `GHOST_ORIGIN` in the compose file. The proxy listens on port 8787; Docker publishes it on loopback. It reuses the Worker's signup, confirmation, and webhook handlers. The Docker image includes the injection script. Incoming sidecar bodies are limited to 1 MiB.
 
-## Install: Ghost(Pro) (webhook cleanup)
+Forward `/members`, `/ghost-guard/`, and, if wanted, `/signup-shield/` to the sidecar. Keep other traffic going to Ghost. For example, in nginx:
 
-**Do not orange-cloud a Ghost(Pro) custom domain.** Official docs require Cloudflare DNS records to be **DNS only**, and stacking another CDN in front of Ghost(Pro) is unsupported:
-
-- https://ghost.org/help/cloudflare-domain-setup/
-- https://ghost.org/help/cdn-provider-support/
-
-A Worker therefore **cannot** intercept `/members/?token=` on Ghost(Pro). Site Header code injection also cannot: Ghost confirms the signup in middleware and 302s before any theme or injected HTML runs.
-
-The easy Ghost(Pro) hook is a **Custom Integration webhook**. This is post-hoc: the member is already created. The default action only **labels** them for review. That is safer than auto-delete.
-
-1. Deploy the same Worker (button or `wrangler deploy`).
-2. Add a route for `yourworkersubdomain.workers.dev/signup-shield/*` (the default `*.workers.dev` URL is enough; you do not need to proxy the blog).
-3. Set secrets and vars:
-
-   ```bash
-   npx wrangler secret put ADMIN_API_KEY    # Staff settings → Integrations → Custom → Admin API key (id:secret)
-   npx wrangler secret put WEBHOOK_SECRET   # any random string, same value you paste into Ghost
-   ```
-
-   In `wrangler.toml` or the dashboard:
-
-   ```
-   CLEANUP_ENABLED = "true"
-   ADMIN_API_URL = "https://your-site.ghost.io"
-   CLEANUP_MODE = "label"
-   CLEANUP_LABEL = "signup-shield-review"
-   ```
-
-   Use `https://your-site.ghost.io` or your custom Admin URL. Set `CLEANUP_MODE=unsubscribe` only if you accept the risk of unsubscribing a real reader who signed up from work.
-
-4. In Ghost Admin: **Settings → Integrations → Add custom integration**. Add a webhook:
-
-   - Event: **Member added**
-   - Target URL: `https://<your-worker>.workers.dev/signup-shield/webhooks/member-added`
-   - Secret: the same `WEBHOOK_SECRET`
-
-5. Filter Members by the label and unsubscribe or delete in bulk after a quick review.
-
-What this mode **cannot** do: Ghost does not store the time between “magic link sent” and “member created”, and it does not store the confirmation request’s user-agent. `created_at` is the confirmation time. Heuristics here are “free member with a non-consumer email domain”. That will also catch real people who subscribe from work, which is why the default is **label**, not delete.
-
-## What this is not
-
-- A replacement for Ghost’s own settings (invite-only / paid-only still wins if you do not need open free signup).
-- An official Ghost plugin.
-- A complete bot-proof system. A human or a solver can still click the button. Optional Turnstile on the confirm page raises that bar.
-- A way to finish Cloudflare Turnstile in Ghost core. That is a separate, still-open spike: https://github.com/TryGhost/Ghost/pull/29136
-
-The durable product fix is an upstream confirmation interstitial in Ghost itself, sketched in [`patch/confirmation-interstitial.md`](patch/confirmation-interstitial.md). Discuss that on the Ghost forum before opening a PR; Ghost does not merge substantial new features without prior discussion.
-
-## Configuration reference
-
-| Name | Where | Purpose |
-| --- | --- | --- |
-| `CONFIRM_SECRET` | secret | Bypass header for the Worker’s own confirm request |
-| `GHOST_ORIGIN` | secret | Direct Ghost origin (recommended) |
-| `SITE_TITLE` | var | Name shown on the confirm page |
-| `INTERSTITIAL_ACTIONS` | var | Default `signup,subscribe,signup-paid` |
-| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET` | var / secret | Optional challenge on the confirm page |
-| `CLEANUP_ENABLED` | var | `true` to enable the webhook |
-| `ADMIN_API_URL` | var | Ghost Admin origin |
-| `ADMIN_API_KEY` | secret | `id:secret` Custom Integration key |
-| `WEBHOOK_SECRET` | secret | Must match the Ghost webhook secret |
-| `CLEANUP_MODE` | var | `label` (default) or `unsubscribe` |
-| `CLEANUP_LABEL` | var | Label applied in `label` mode |
-| `CLEANUP_SKIP_DOMAINS` | var | Consumer domains that are never labelled |
-
-## Development
-
-```bash
-npm install
-npm run dev          # wrangler dev
-npm run sidecar      # node sidecar/server.mjs
+```nginx
+location = /members {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+location /members/ {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+location /ghost-guard/ {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $host;
+}
 ```
 
-Point a test Ghost’s public URL at the dev Worker or sidecar and use a signup link from the confirmation email.
+The sidecar uses the TCP peer's IP by default and ignores client-supplied `CF-Connecting-IP` and `X-Forwarded-For`. Behind nginx/Caddy, set **`TRUST_PROXY=true`** and ensure the immediate proxy **overwrites** `X-Forwarded-For` with the real client IP, as above. Do not append an untrusted incoming header, and prevent direct public access to the sidecar. Otherwise, all visitors may share the proxy's IP quota or clients may spoof addresses. Without a trusted proxy, leave this setting false. In Workers, Cloudflare supplies `CF-Connecting-IP`.
+
+Use the same Code Injection snippet above for sidecar Turnstile. Its secret and quota variables are supplied through environment variables; `CONFIRM_SECRET` is unnecessary when the sidecar forwards directly to Ghost.
+
+## Ghost(Pro) note
+
+Ghost(Pro) does **not support another CDN/proxy in front of its service**; [Ghost's CDN policy](https://ghost.org/help/cdn-provider-support/) explains the restriction. Do not orange-cloud a Ghost(Pro) custom domain or deploy this request-intercepting setup there. Code Injection alone cannot enforce protection on Ghost's API or stop a confirmation that happens before theme HTML runs.
+
+Use [Ghost's built-in signup spam protection](https://ghost.org/help/signup-spam-protection/) and contact Ghost support about recurring abuse. The only mode provided here for Ghost(Pro) is the **webhook labeller**, which runs after a member already exists. Do not add the Turnstile injection snippet for this mode.
+
+### Optional webhook labeller
+
+This handler only adds the fixed label **`signup-shield-review`**. It never deletes members or changes their newsletter subscriptions. Non-consumer email domains are a review heuristic, not proof of abuse; genuine work-address subscribers can be labelled too.
+
+Deploy the Worker and use its default `workers.dev` URL (no proxy in front of your blog is needed). Configure:
+
+```bash
+npx wrangler secret put ADMIN_API_KEY
+npx wrangler secret put WEBHOOK_SECRET
+```
+
+In `wrangler.toml` or the dashboard:
+
+```toml
+CLEANUP_ENABLED = "true"
+ADMIN_API_URL = "https://your-site.ghost.io"
+```
+
+Create a **Custom Integration** in Ghost Admin with a **Member added** webhook targeting:
+
+```text
+https://YOUR-WORKER.workers.dev/signup-shield/webhooks/member-added
+```
+
+Use the same `WEBHOOK_SECRET` in Ghost. Its signature is required and checked with a five-minute timestamp tolerance. `ADMIN_API_KEY` is the integration's `id:secret` Admin API key. The labeller skips paid members and domains listed in `CLEANUP_SKIP_DOMAINS`, preserves existing labels, and avoids duplicating the review label. The sidecar supports the same webhook settings if you need it for a self-hosted site.
+
+`CLEANUP_MODE` and `CLEANUP_LABEL` have been removed. Even a leftover `CLEANUP_MODE=unsubscribe` cannot enable automatic unsubscribing. Without `CLEANUP_SKIP_DOMAINS`, all new free members are eligible for review; the supplied Worker config includes common consumer domains. Webhook labelling does not prevent creation or establish that a signup is spam.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GHOST_ORIGIN` | Worker: same-zone; sidecar: `http://127.0.0.1:2368` | Direct Ghost origin; Worker secret recommended |
+| `CONFIRM_SECRET` | unset | Worker's secret bypass header for confirmation forwarding |
+| `SITE_TITLE` | `this publication` | Name on the confirmation page |
+| `INTERSTITIAL_ACTIONS` | `signup,subscribe,signup-paid` | Magic-link actions requiring a click |
+| `TURNSTILE_SECRET` | unset | Enables server-side Turnstile on signup requests only |
+| `TURNSTILE_HOSTNAME` | request hostname | Expected verified Turnstile hostname |
+| `SIGNUP_IP_LIMIT` | `5` | Allowed signup attempts per IP/window |
+| `SIGNUP_IP_WINDOW_SECONDS` | `3600` | IP window in seconds |
+| `SIGNUP_EMAIL_LIMIT` | `3` | Allowed signup attempts per normalized email/window |
+| `SIGNUP_EMAIL_WINDOW_SECONDS` | `86400` | Email window in seconds |
+| `SIGNUP_RATE_LIMITER` | Wrangler binding | SQLite Durable Object namespace, Worker only |
+| `ASSETS` | Wrangler binding | Serves the injection script, Worker only |
+| `PORT` | `8787` | Sidecar listening port |
+| `TRUST_PROXY` | `false` | Sidecar only: trust an overwritten X-Forwarded-For from your proxy |
+| `CLEANUP_ENABLED` | `false` | Enables label-only webhook when exactly `true` |
+| `ADMIN_API_URL` | unset | Ghost Admin origin for the webhook |
+| `ADMIN_API_KEY` | unset | Secret `id:secret` Custom Integration key |
+| `WEBHOOK_SECRET` | unset | Required webhook signing secret when enabled |
+| `CLEANUP_SKIP_DOMAINS` | See `wrangler.toml` | Comma-separated domains excluded from review |
+
+Quota values must be positive integers; invalid/zero values fall back to the defaults. Windows are in seconds. There is no public signup-protection bypass flag. Keep Ghost's own invite-only or paid-only settings if open free signup is unnecessary.
+
+## Verification and development
+
+```bash
+npm ci
+npm test
+npm run check
+npx wrangler deploy --dry-run
+npm run dev
+# or: npm run sidecar
+```
+
+Tests use Node's built-in runner, mocked Siteverify responses, SQLite-backed counter tests, actual local HTTP sidecar requests, and Wrangler's local Worker runtime with real asset and Durable Object bindings. The browser script is exercised in a simulated DOM with a mocked Turnstile widget. `npm run check` includes `node --check` on both entry files, the limiter, and the public script. Local development/tests need Node 22.16+. No real Ghost or Cloudflare account is needed for the tests.
+
+Before production, use a test Ghost publication and addresses you control:
+
+1. With Turnstile enabled, sign up through Portal and verify that a token reaches the proxy. A direct signup API request without a token should return 400 and send no email. Confirm sign-in still works.
+2. With small test quotas, exceed each limit independently and check 429 plus `Retry-After`. Restore the production values afterwards.
+3. Open a fresh signup magic link in a private window (or use GET/HEAD from curl). It must return 200 HTML, without creating a member or consuming the token.
+4. Click **Confirm signup**; check Ghost creates the member, redirects, and sets the session cookie. The confirmation page needs no JavaScript, even with signup Turnstile enabled.
+5. Test your actual Portal/theme version, reverse proxy, trusted client IP, and Turnstile hostname. Custom clients must provide tokens when protection is enabled.
+
+These layers reduce automated submissions and scanner confirmations; neither a button nor a challenge guarantees a human subscriber. The confirmation page alone does not stop emails being sent. This repository also contains an [upstream Ghost confirmation-page proposal](patch/confirmation-interstitial.md), not a ready-to-apply Ghost core patch.
+
+To roll back, remove the proxy routes and the Code Injection snippet. On Cloudflare, remove both `/members*` and `/ghost-guard/*` routes together; Ghost then receives requests directly again.

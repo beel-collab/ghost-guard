@@ -1,0 +1,99 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { MemoryRateLimiter, SignupRateLimiter, checkSignupRateLimit, rateLimitConfig } from '../src/rate-limit.js';
+
+// Run the DO's real SQL against SQLite; the Worker integration smoke test uses
+// Wrangler's actual Durable Object runtime as well.
+function sqliteStorage() {
+  const db = new DatabaseSync(':memory:');
+  let alarm = null;
+  return {
+    db,
+    sql: { exec(query, ...args) {
+      const statement = db.prepare(query);
+      if (statement.columns().length) return { toArray: () => statement.all(...args) };
+      statement.run(...args);
+      return { toArray: () => [] };
+    } },
+    transactionSync(callback) {
+      db.exec('BEGIN');
+      try { const result = callback(); db.exec('COMMIT'); return result; }
+      catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    async getAlarm() { return alarm; },
+    async setAlarm(value) { alarm = value; },
+  };
+}
+function durableAdapter(storage) {
+  const object = new SignupRateLimiter({ storage });
+  return { object, consume: async (buckets) => (await object.fetch(new Request('https://limits/consume', { method: 'POST', body: JSON.stringify({ buckets }) }))).json() };
+}
+const buckets = (ip = 'ip:one', email = 'email:one') => [
+  { key: ip, limit: 5, windowMs: 3600000 },
+  { key: email, limit: 3, windowMs: 86400000 },
+];
+
+for (const adapter of ['memory', 'durable']) {
+  test(`${adapter}: concurrent requests cannot exceed either quota`, async (t) => {
+    const storage = adapter === 'durable' ? sqliteStorage() : null;
+    if (storage) t.after(() => storage.db.close());
+    const limiter = storage ? durableAdapter(storage) : new MemoryRateLimiter();
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) => limiter.consume(buckets('ip:one', `email:${i}`))));
+    assert.equal(results.filter((r) => r.allowed).length, 5);
+    assert.equal(results.filter((r) => !r.allowed).length, 15);
+    assert.ok(results.find((r) => !r.allowed).retryAfter > 3590);
+  });
+
+  test(`${adapter}: rejected email quota does not burn a different IP quota; windows expire`, async (t) => {
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    const storage = adapter === 'durable' ? sqliteStorage() : null;
+    if (storage) t.after(() => storage.db.close());
+    const limiter = storage ? durableAdapter(storage) : new MemoryRateLimiter();
+    for (let i = 0; i < 3; i++) assert.equal((await limiter.consume(buckets(`ip:${i}`, 'email:full'))).allowed, true);
+    for (let i = 0; i < 8; i++) assert.equal((await limiter.consume(buckets('ip:fresh', 'email:full'))).allowed, false);
+    for (let i = 0; i < 5; i++) assert.equal((await limiter.consume(buckets('ip:fresh', `email:new${i}`))).allowed, true);
+    assert.equal((await limiter.consume(buckets('ip:fresh', 'email:another'))).allowed, false);
+    now += 3600000;
+    assert.equal((await limiter.consume(buckets('ip:fresh', 'email:another'))).allowed, true);
+    assert.equal((await limiter.consume(buckets('ip:fresh', 'email:full'))).allowed, false);
+    now += 86400000;
+    assert.equal((await limiter.consume(buckets('ip:fresh', 'email:full'))).allowed, true);
+  });
+}
+
+test('Durable Object counters survive object reconstruction and expired rows are removed by alarms', async (t) => {
+  const storage = sqliteStorage();
+  t.after(() => storage.db.close());
+  let now = 1_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const limiter = durableAdapter(storage);
+  for (let i = 0; i < 3; i++) await limiter.consume(buckets());
+  const recreated = durableAdapter(storage);
+  assert.equal((await recreated.consume(buckets())).allowed, false);
+  assert.ok(await storage.getAlarm());
+  now += 86400000;
+  await recreated.object.alarm();
+  assert.equal(storage.sql.exec('SELECT key FROM counters').toArray().length, 0);
+});
+
+test('Worker uses the durable namespace and stores digests instead of email/IP', async () => {
+  const seen = {};
+  const env = { SIGNUP_RATE_LIMITER: {
+    idFromName: (name) => { seen.name = name; return 'object-id'; },
+    get: (id) => ({ async fetch(url, init) { seen.id = id; seen.body = init.body; return Response.json({ allowed: true }); } }),
+  } };
+  const response = await checkSignupRateLimit(new Request('https://blog.example/members/api/send-magic-link/', { headers: { 'CF-Connecting-IP': '192.0.2.1' } }), 'Reader@Work.Example', env);
+  assert.equal(response.allowed, true);
+  assert.equal(seen.name, 'https://blog.example');
+  assert.equal(seen.id, 'object-id');
+  assert.doesNotMatch(seen.body, /192\.0\.2\.1|reader|work\.example/i);
+  assert.match(JSON.parse(seen.body).buckets[0].key, /^ip:[a-f0-9]{64}$/);
+});
+
+test('invalid configuration falls back to safe defaults', () => {
+  assert.deepEqual(rateLimitConfig({ SIGNUP_IP_LIMIT: '0', SIGNUP_EMAIL_LIMIT: '-1', SIGNUP_IP_WINDOW_SECONDS: 'oops' }), {
+    ipLimit: 5, emailLimit: 3, ipWindowMs: 3600000, emailWindowMs: 86400000,
+  });
+});
