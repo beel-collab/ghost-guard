@@ -187,7 +187,7 @@ export function createGuardServer(env = process.env) {
         return;
       }
       res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end('signup-shield proxy error');
+      res.end('ghost-guard proxy error');
     }
   });
 }

@@ -14,6 +14,8 @@ import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.
 export { SignupRateLimiter } from './rate-limit.js';
 import { handleMemberAddedWebhook } from './webhook.js';
 export { MemberLabeller } from './webhook.js';
+import { handleSetup, pageHeaders, withStoredConfig } from './setup.js';
+export { SetupStore } from './setup.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
 const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
@@ -22,6 +24,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = canonicalPath(url.pathname);
+    if (path === '/ghost-guard/setup') return handleSetup(request, env);
+    env = await withStoredConfig(env);
     // Outside a subfolder install the path belongs to whatever else serves this
     // hostname, so it goes to the zone's normal origin, not to Ghost. The
     // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
@@ -31,11 +35,13 @@ export default {
       ? (forwarded) => forwardToOrigin(forwarded, env)
       : (forwarded) => forwardToZone(forwarded);
 
-    if (url.pathname === '/ghost-guard/turnstile.js') {
+    if (path === '/ghost-guard/turnstile.js') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
       }
-      return env.ASSETS.fetch(request);
+      const assetUrl = new URL(request.url);
+      assetUrl.pathname = '/ghost-guard/turnstile.js';
+      return env.ASSETS.fetch(new Request(assetUrl, { method: request.method, headers: request.headers }));
     }
 
     // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
@@ -149,7 +155,7 @@ function insideGhost(path, env) {
 // The sidecar buffers and size-limits only the bodies ghost-guard reads.
 export function readsRequestBody(pathname) {
   const path = canonicalPath(pathname);
-  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/');
+  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/') || path === '/ghost-guard/setup';
 }
 
 // Lowercased, without trailing slashes, and with repeated slashes collapsed:
@@ -212,7 +218,15 @@ async function confirmAndForward(request, url, env, forward) {
   let referrer = url.searchParams.get('r');
 
   if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
-    const form = await request.formData();
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return new Response(renderInterstitial(url, env, 'The confirmation form was invalid. Please try again.'), {
+        status: 400,
+        headers: htmlHeaders(),
+      });
+    }
     token = String(form.get('token') || token || '');
     action = String(form.get('action') || action || '');
     referrer = String(form.get('r') || referrer || '');
@@ -318,12 +332,7 @@ async function verifyTurnstile(token, env, request) {
 }
 
 function htmlHeaders() {
-  return {
-    'content-type': 'text/html; charset=utf-8',
-    'cache-control': 'no-store, no-cache, must-revalidate',
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-  };
+  return pageHeaders();
 }
 
 function escapeHtml(value) {

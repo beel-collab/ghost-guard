@@ -138,10 +138,10 @@ test('Wrangler runtime retries a failed webhook labelling from the Durable Objec
   const src = new URL('../src/', import.meta.url);
   const entry = join(temp, 'fast-retry-worker.js');
   await writeFile(entry, `
-    import worker, { SignupRateLimiter, MemberLabeller } from ${JSON.stringify(fileURLToPath(new URL('worker.js', src)))};
+    import worker, { SignupRateLimiter, MemberLabeller, SetupStore } from ${JSON.stringify(fileURLToPath(new URL('worker.js', src)))};
     import { RETRY_DELAYS_MS } from ${JSON.stringify(fileURLToPath(new URL('webhook.js', src)))};
     RETRY_DELAYS_MS.splice(0, RETRY_DELAYS_MS.length, 200, 200);
-    export { SignupRateLimiter, MemberLabeller };
+    export { SignupRateLimiter, MemberLabeller, SetupStore };
     export default worker;
   `);
   const adminUrl = `http://127.0.0.1:${origin.address().port}`;

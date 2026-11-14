@@ -11,17 +11,63 @@ The confirmation page has no JavaScript, auto-submit, or Turnstile widget. Expli
 
 Ghost has no official plugin system. This is a proxy prototype, not an official Ghost plugin. It has automated tests but has not been deployed against a production Ghost site.
 
+## Quick start
+
+Your Ghost hostname must already be proxied by Cloudflare (the orange cloud). Ghost(Pro) cannot sit behind this proxy; use the webhook-only note further down instead.
+
+1. Click **Deploy to Cloudflare** above. When the deploy asks, set `SETUP_TOKEN` to a long random string. That value is the password for the setup page. Leave the Worker name as `ghost-guard`.
+2. Open `https://yourdomain.com/ghost-guard/setup`. The hostname route does not exist yet, so use the `*.workers.dev` URL from the deploy result first, for example `https://ghost-guard.<account>.workers.dev/ghost-guard/setup`. The form attaches `yourdomain.com/*` for you.
+3. Submit the one form: the setup token, the public Ghost URL (`https://yourdomain.com` or `https://yourdomain.com/blog`), the custom integration's Admin API key (`id:secret`), and a Cloudflare API token. A subfolder and the webhook labeller are optional.
+
+From a checkout, set the token yourself and deploy:
+
+```bash
+npm ci
+npx wrangler login
+npx wrangler secret put SETUP_TOKEN
+npx wrangler deploy
+```
+
+If `SETUP_TOKEN` is empty, the first visit generates one and prints it **only** in the Worker logs (`npx wrangler tail`, or the dashboard log stream), with the same `npx wrangler secret put SETUP_TOKEN` instruction. The page never shows the token. Eight wrong attempts from one address are refused for 15 minutes. After setup finishes, opening the page shows status only; running it again asks for the token on the form.
+
+The Deploy button reads `.dev.vars.example`, which lists `SETUP_TOKEN` so the dashboard can ask for it. `wrangler deploy` from a checkout does not prompt.
+
+### Cloudflare API token
+
+Create the token at <https://dash.cloudflare.com/profile/api-tokens> and include the Ghost zone:
+
+| Scope | Permission |
+| --- | --- |
+| Zone | Workers Routes: Edit |
+| Account | Turnstile: Edit |
+| Account | Workers Scripts: Edit |
+
+The account ID is taken from the zone. Paste one into the form only if discovery fails. The token is used for that request and is not stored.
+
+### What the form changes
+
+- **Cloudflare:** route `<host>/*` on the `ghost-guard` Worker (reused if it already points at this script). A managed Turnstile widget named `ghost-guard-<host>` for that hostname. Worker secrets `TURNSTILE_SECRET` and, when the labeller is on, `WEBHOOK_SECRET` and `ADMIN_API_KEY`.
+- **This Worker:** a `SetupStore` Durable Object holds the runtime copy (Turnstile secret, and the labeller settings when enabled). The Worker reads it when the matching environment value is unset. `ADMIN_API_URL`, `CLEANUP_ENABLED`, and `GHOST_BASE_PATH` are plain vars in `wrangler.toml`, so they cannot be replaced through the secret API without rewriting every binding; they live in the Durable Object. A non-empty environment variable still wins, except `CLEANUP_ENABLED`, which wins only when it is exactly `true` (the file ships `"false"`). Leave `ADMIN_API_URL` empty to let the form's site URL drive the labeller.
+- **Ghost:** the Turnstile snippet is added to **Code injection → Site header**, wrapped in `<!-- ghost-guard:start -->` … `<!-- ghost-guard:end -->`. HTML outside those markers is left in place. A re-run replaces only that block. The Admin API key is the `id:secret` from a **custom integration**. Ghost only allows webhook creation on that same integration; the form sends the key's id and, if Ghost rejects it, retries without forcing a different integration.
+- **Webhook, if checked:** one `member.added` webhook aimed at `https://<host>/signup-shield/webhooks/member-added` (the domain root, even when Ghost is in a subfolder). The label stays `signup-shield-review`. The Admin API key is stored only in this case.
+
+Submitting again is safe: an existing route, widget, and webhook are reused, and the header block is not duplicated. The result is a checklist. A red row includes a one-line fix. The confirmation check uses a fake token and does not create a member. The sign-in check uses `ghost-guard-setup-check@example.invalid` and does not create a member. A Worker cannot fetch its own zone (that request skips the Worker), so if you open setup on the Ghost hostname the route row says the page itself is the proof.
+
+The form does not set `GHOST_ORIGIN` or `CONFIRM_SECRET`. With no direct origin, the Worker forwards to the hostname's normal Cloudflare origin and does not need the bypass secret. Set those two by hand when Ghost is not that origin; the manual section below has the commands. Quotas and `SITE_TITLE` stay in `wrangler.toml`. The Node sidecar does not call the Cloudflare API; it shows a short page that links here.
+
 | Hosting | Deployment |
 | --- | --- |
 | Self-hosted with Cloudflare proxy | Cloudflare Worker with a SQLite-backed Durable Object |
 | Self-hosted without Cloudflare proxy | Node 22.16+ sidecar, optionally Docker |
 | Ghost(Pro) | Webhook labeller only; see the Ghost(Pro) note below |
 
-## Self-hosted: Cloudflare Worker
+## Advanced: manual Cloudflare setup
+
+Use this when you are not using `/ghost-guard/setup`. The [Quick start](#quick-start) form does these steps for you.
 
 Your Ghost hostname must already be proxied by Cloudflare.
 
-**One-click:** the **Deploy to Cloudflare** button above copies this repository to your GitHub account and deploys the Worker with its Durable Objects and assets from `wrangler.toml`. Afterwards, set the secrets (`CONFIRM_SECRET`, `GHOST_ORIGIN`, and `TURNSTILE_SECRET` if used) in **Workers & Pages → ghost-guard → Settings → Variables and Secrets**, then attach the route described below.
+**One-click:** the **Deploy to Cloudflare** button at the top copies this repository and deploys the Worker with its Durable Objects and assets from `wrangler.toml`. Set `SETUP_TOKEN` when the deploy asks, then use the setup page. To configure by hand instead, set `CONFIRM_SECRET`, `GHOST_ORIGIN`, and `TURNSTILE_SECRET` if used, in **Workers & Pages → ghost-guard → Settings → Variables and Secrets**, then attach the route described below.
 
 **From a checkout:**
 
@@ -35,7 +81,7 @@ npx wrangler deploy
 
 Use a long random `CONFIRM_SECRET`. Set `GHOST_ORIGIN` to a direct, DNS-only Ghost origin such as `https://origin.example.com`. The confirmation request includes the secret as `X-Ghost-Signup-Shield` to avoid intercepting its own follow-up request. A direct origin is recommended; without one the Worker uses same-zone forwarding. Restrict direct origin access to your proxy so attackers cannot bypass it.
 
-`wrangler.toml` includes the static asset binding, the signup limiter and member labeller Durable Object bindings, and their `v1`/`v2` migrations. Deploy with this configuration when upgrading so the new labeller binding is present; a missing binding fails closed when the webhook is enabled. There is no KV namespace to create. Set `SITE_TITLE` and quotas in `[vars]` before deploying.
+`wrangler.toml` includes the static asset binding, the signup limiter, member labeller, and setup-store Durable Object bindings, and their `v1`/`v2`/`v3` migrations. Deploy with this configuration when upgrading so the labeller and setup bindings are present; a missing labeller binding fails closed when the webhook is enabled, and a missing setup binding makes `/ghost-guard/setup` report that the migration has not run. There is no KV namespace to create. Set `SITE_TITLE` and quotas in `[vars]` before deploying.
 
 In Cloudflare **Workers & Pages → ghost-guard → Settings/Triggers → Routes**, attach:
 
@@ -151,7 +197,7 @@ CLEANUP_ENABLED = "true"
 ADMIN_API_URL = "https://your-site.ghost.io"   # include the subfolder, e.g. https://example.com/blog
 ```
 
-Create a **Custom Integration** in Ghost Admin with a **Member added** webhook targeting:
+Create a **Custom Integration** in Ghost Admin with a **Member added** webhook targeting the integration that owns the Admin API key (Ghost rejects webhooks for any other integration). The setup form does this when the labeller box is checked. By hand, target:
 
 ```text
 https://YOUR-WORKER.workers.dev/signup-shield/webhooks/member-added
@@ -167,7 +213,9 @@ The Worker routes each member's deliveries through the same **`MemberLabeller` D
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GHOST_ORIGIN` | Worker: same-zone; sidecar: `http://127.0.0.1:2368` | Direct Ghost origin; Worker secret recommended |
+| `SETUP_TOKEN` | unset | Password for `/ghost-guard/setup`. `npx wrangler secret put SETUP_TOKEN`, or the value the Deploy button asks for. If it is empty, the first visit generates one and prints it only to the Worker logs |
+| `SETUP_STORE` | Wrangler binding | Durable Object the setup page writes. The Worker reads it when the matching environment value is unset |
+| `GHOST_ORIGIN` | Worker: same-zone; sidecar: `http://127.0.0.1:2368` | Direct Ghost origin; Worker secret recommended. Not set by the setup form |
 | `CONFIRM_SECRET` | unset | Worker's secret bypass header for confirmation forwarding |
 | `SITE_TITLE` | `this publication` | Name on the confirmation page |
 | `GHOST_BASE_PATH` | unset (domain root) | Worker only: subfolder Ghost is installed in, such as `/blog`, so other paths go to the zone origin instead of `GHOST_ORIGIN`; set it in `wrangler.toml` so deploys keep it |

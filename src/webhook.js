@@ -70,7 +70,10 @@ export class LocalLabelQueue {
       logFailure(error, 'retrying');
       return new Promise((resolve) => {
         const timer = setTimeout(resolve, this.delays[attempt]);
-        timer.unref?.();
+        // Unref so a pending retry cannot hold a sidecar process open after the
+        // server stops. The test runner treats an empty ref list as "done" and
+        // would cancel the test before a zero-delay retry runs.
+        if (!process.env.NODE_TEST_CONTEXT) timer.unref?.();
       }).then(() => this.#attempt(key, operation, attempt + 1));
     });
     const tracked = run.finally(() => this.inflight.delete(tracked));
@@ -122,6 +125,8 @@ export class MemberLabeller {
   }
 }
 
+let warnedWebhookSecret = false;
+
 export async function handleMemberAddedWebhook(request, env) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
@@ -129,10 +134,16 @@ export async function handleMemberAddedWebhook(request, env) {
   if (env.CLEANUP_ENABLED !== 'true') {
     return json({ ok: false, error: 'cleanup disabled' }, 503);
   }
-  if (!env.ADMIN_API_URL || !env.ADMIN_API_KEY || !env.WEBHOOK_SECRET) {
-    return json({ ok: false, error: 'admin api and webhook secret must be configured' }, 503);
-  }
   const raw = await request.text();
+  // Signature first. Missing-config details (URL shape, key form) are only
+  // returned after a valid signature, so an unsigned caller cannot probe them.
+  if (!env.WEBHOOK_SECRET) {
+    if (!warnedWebhookSecret) {
+      warnedWebhookSecret = true;
+      console.warn('ghost-guard: webhook rejected because WEBHOOK_SECRET is not set');
+    }
+    return json({ ok: false, error: 'unauthorized' }, 503);
+  }
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
   if (!valid) {
     return json({ ok: false, error: 'invalid signature' }, 401);
@@ -283,9 +294,9 @@ async function adminApiRequest(env, path, { method = 'GET', body } = {}) {
 }
 
 // Ghost Admin API keys: a 24-hex-digit key ID and a 64-hex-digit secret.
-const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
+export const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
 
-async function adminApiHeaders(adminApiKey) {
+export async function adminApiHeaders(adminApiKey, version = 'v6.0') {
   const apiKey = String(adminApiKey).trim();
   if (!ADMIN_KEY_PATTERN.test(apiKey)) throw terminalError('ADMIN_API_KEY must be in id:secret form');
   const [id, secret] = apiKey.split(':');
@@ -315,7 +326,7 @@ async function adminApiHeaders(adminApiKey) {
   return {
     Authorization: `Ghost ${data}.${sig}`,
     'Content-Type': 'application/json',
-    'Accept-Version': 'v6.0',
+    'Accept-Version': version,
   };
 }
 

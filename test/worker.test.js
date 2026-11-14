@@ -137,6 +137,8 @@ test('all signup confirmation pages require a form POST and have no script or au
     assert.match(html, /Confirm signup/);
     assert.doesNotMatch(html, /<script|turnstile|onload=|\.submit\(|requestSubmit|http-equiv="refresh"/i);
     assert.equal(response.headers.get('cache-control'), 'no-store, no-cache, must-revalidate');
+    assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'");
+    assert.equal(response.headers.get('x-frame-options'), 'DENY');
     const head = await worker.fetch(new Request(url, { method: 'HEAD' }), envFor());
     assert.equal(head.status, 200);
     assert.equal(await head.text(), '');
@@ -307,6 +309,35 @@ test('an invalid base path keeps the rest of the site on its zone origin and log
   // The sidecar has no zone origin: it always uses GHOST_ORIGIN.
   await worker.fetch(new Request('https://blog.example/about/'), { ...env, SIDECAR: true });
   assert.equal(host(calls.origin[2]), 'origin.example');
+});
+
+test('a malformed confirmation form is rejected without calling Ghost', async (t) => {
+  const calls = mockFetch(t);
+  const response = await worker.fetch(new Request('https://blog.example/members/?token=abc&action=signup', {
+    method: 'POST',
+    headers: { 'content-type': 'multipart/form-data; boundary=----bound' },
+    body: 'not a form',
+  }), envFor());
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /confirmation form was invalid/);
+  assert.equal(calls.origin.length, 0);
+});
+
+test('the Turnstile script path ignores case and repeated slashes', async () => {
+  let seen = '';
+  const env = envFor({
+    ASSETS: {
+      fetch: async (request) => {
+        seen = new URL(request.url).pathname;
+        return new Response('ok');
+      },
+    },
+  });
+  for (const path of ['/Ghost-Guard/Turnstile.JS', '/ghost-guard//turnstile.js', '/ghost-guard/turnstile.js/']) {
+    const response = await worker.fetch(new Request(`https://blog.example${path}`), env);
+    assert.equal(response.status, 200, path);
+    assert.equal(seen, '/ghost-guard/turnstile.js');
+  }
 });
 
 test('GHOST_BASE_PATH is normalized and rejects values a path could never match', () => {

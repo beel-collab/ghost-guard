@@ -224,6 +224,17 @@ test('unsigned requests learn nothing about the Admin API configuration', async 
   assert.doesNotMatch(await response.text(), /ADMIN_API/);
 });
 
+test('missing admin configuration is not described until the signature is valid', async (t) => {
+  t.mock.method(console, 'warn', () => {});
+  const unsigned = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
+  const missingSecret = await worker.fetch(unsigned(), { ...env, WEBHOOK_SECRET: undefined, ADMIN_API_URL: 'not a url', ADMIN_API_KEY: 'id:secret' });
+  assert.equal(missingSecret.status, 503);
+  assert.doesNotMatch(await missingSecret.text(), /ADMIN_API|not a url|id:secret|webhook secret/);
+  const missingAdmin = await worker.fetch(unsigned(), { ...env, ADMIN_API_URL: '', ADMIN_API_KEY: '' });
+  assert.equal(missingAdmin.status, 401);
+  assert.doesNotMatch(await missingAdmin.text(), /ADMIN_API|configured/);
+});
+
 test('sidecar does not retry errors that retrying cannot fix', async (t) => {
   const state = ghost(t);
   state.readStatus = 401;
