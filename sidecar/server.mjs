@@ -144,6 +144,8 @@ export function createGuardServer(env = process.env) {
       }
       stripHopByHop(headers);
       headers.delete('content-length');
+      // Node already answered 100 Continue; its fetch rejects an Expect header.
+      headers.delete('expect');
       headers.set('CF-Connecting-IP', ip || 'unknown');
       headers.set('X-Forwarded-For', ip || 'unknown');
       headers.delete('X-Ghost-Signup-Shield');

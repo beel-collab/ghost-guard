@@ -22,6 +22,14 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = canonicalPath(url.pathname);
+    // Outside a subfolder install the path belongs to whatever else serves this
+    // hostname, so it goes to the zone's normal origin, not to Ghost. The
+    // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
+    // requests use the same rule, so a lookalike path on a root app still
+    // reaches that app after the checks.
+    const forward = env.SIDECAR === true || insideGhost(path, env)
+      ? (forwarded) => forwardToOrigin(forwarded, env)
+      : (forwarded) => forwardToZone(forwarded);
 
     if (url.pathname === '/ghost-guard/turnstile.js') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -34,7 +42,7 @@ export default {
     // serves these under <subfolder>/members, and covering a lookalike path
     // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
     if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
-      return handleSendMagicLink(request, env);
+      return handleSendMagicLink(request, env, forward);
     }
 
     if (url.pathname === '/signup-shield/webhooks/member-added') {
@@ -42,18 +50,14 @@ export default {
     }
 
     if (path.endsWith('/members') && url.searchParams.has('token')) {
-      return handleMagicLink(request, url, env);
+      return handleMagicLink(request, url, env, forward);
     }
 
-    // Outside a subfolder install the path belongs to whatever else serves this
-    // hostname, so it goes to the zone's normal origin, not to Ghost. The
-    // sidecar has no zone origin; nginx only sends it Ghost's paths.
-    if (env.SIDECAR !== true && !insideGhost(path, env)) return forwardToZone(request);
-    return forwardToOrigin(request, env);
+    return forward(request);
   },
 };
 
-async function handleSendMagicLink(request, env) {
+async function handleSendMagicLink(request, env, forward) {
   let body;
   try {
     body = await request.clone().json();
@@ -66,7 +70,7 @@ async function handleSendMagicLink(request, env) {
 
   // Only the explicit signin type is exempt. Missing/unknown types must not
   // become an alternative path to an unprotected signup.
-  if (body.emailType === 'signin') return forwardToOrigin(request, env);
+  if (body.emailType === 'signin') return forward(request);
   if (typeof body.email !== 'string' || !body.email.trim()) {
     return portalError('Please enter an email address.', 400);
   }
@@ -90,7 +94,7 @@ async function handleSendMagicLink(request, env) {
   headers.delete('cf-turnstile-response');
   headers.delete('content-length');
   delete body['cf-turnstile-response'];
-  return forwardToOrigin(new Request(request, { headers, body: JSON.stringify(body) }), env);
+  return forward(new Request(request, { headers, body: JSON.stringify(body) }));
 }
 
 async function rateLimitRejection(check) {
@@ -171,14 +175,14 @@ function shouldInterstitial(url, env) {
   return interstitialActions(env).has(action);
 }
 
-async function handleMagicLink(request, url, env) {
+async function handleMagicLink(request, url, env, forward) {
   const secret = env.CONFIRM_SECRET;
   if (secret && request.headers.get(BYPASS_HEADER) === secret) {
-    return forwardToOrigin(request, env);
+    return forward(request);
   }
 
   if (!shouldInterstitial(url, env)) {
-    return forwardToOrigin(request, env);
+    return forward(request);
   }
 
   if (request.method === 'GET' || request.method === 'HEAD') {
@@ -195,13 +199,13 @@ async function handleMagicLink(request, url, env) {
   }
 
   if (request.method === 'POST') {
-    return confirmAndForward(request, url, env);
+    return confirmAndForward(request, url, env, forward);
   }
 
   return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD, POST' } });
 }
 
-async function confirmAndForward(request, url, env) {
+async function confirmAndForward(request, url, env, forward) {
   const contentType = request.headers.get('content-type') || '';
   let token = url.searchParams.get('token');
   let action = url.searchParams.get('action');
@@ -232,7 +236,7 @@ async function confirmAndForward(request, url, env) {
     headers: originForwardHeaders(request, env),
   });
 
-  return forwardToOrigin(originRequest, env);
+  return forward(originRequest);
 }
 
 function originForwardHeaders(request, env) {
@@ -246,11 +250,13 @@ function originForwardHeaders(request, env) {
 }
 
 // The hostname's normal Cloudflare origin, as if the Worker were not routed.
+// Same-zone subrequests do not re-enter this Worker, so the bypass header is
+// never needed here; dropping it keeps CONFIRM_SECRET away from other apps.
 function forwardToZone(request) {
   const clientIp = request.headers.get('CF-Connecting-IP');
-  if (!clientIp) return fetch(request);
   const headers = new Headers(request.headers);
-  headers.set('X-Forwarded-For', clientIp);
+  headers.delete(BYPASS_HEADER);
+  if (clientIp) headers.set('X-Forwarded-For', clientIp);
   return fetch(new Request(request, { headers }));
 }
 

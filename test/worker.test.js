@@ -317,3 +317,18 @@ test('GHOST_BASE_PATH is normalized and rejects values a path could never match'
     assert.throws(() => ghostBasePath({ GHOST_BASE_PATH: value }), /GHOST_BASE_PATH/, value);
   }
 });
+
+test('subfolder install: lookalike protected paths on the root app are checked, then reach the root app', async (t) => {
+  const calls = mockFetch(t, { success: true, hostname: 'blog.example', action: 'ghost_signup' });
+  const env = envFor({ GHOST_BASE_PATH: '/blog', CONFIRM_SECRET: 'confirm-secret' });
+  await worker.fetch(new Request('https://blog.example/api/teams/7/members?token=abc'), env);
+  await worker.fetch(new Request('https://blog.example/app/members?token=abc&action=signup', {
+    method: 'POST', body: new URLSearchParams({ token: 'abc', action: 'signup' }),
+  }), env);
+  await worker.fetch(signup({}, {}, 'https://blog.example/x/members/api/send-magic-link'), env);
+  assert.deepEqual(calls.origin.map(host), ['blog.example', 'blog.example', 'blog.example']);
+  assert.ok(calls.origin.every((request) => request.headers.get('X-Ghost-Signup-Shield') === null));
+  // Ghost's own paths still reach GHOST_ORIGIN.
+  await worker.fetch(signup({}, {}, 'https://blog.example/blog/members/api/send-magic-link'), env);
+  assert.equal(host(calls.origin[3]), 'origin.example');
+});

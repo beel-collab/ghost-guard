@@ -312,3 +312,18 @@ test('sidecar streams Ghost Admin uploads and large responses, and caps only bod
   }
   assert.equal(received.length, 2);
 });
+
+test('sidecar forwards uploads sent with Expect: 100-continue', async (t) => {
+  const { guard, calls } = await setup(t);
+  const status = await new Promise((resolve, reject) => {
+    const body = Buffer.alloc(64 * 1024, 'a');
+    const req = http.request(`${guard}/ghost/api/admin/images/upload/`, {
+      method: 'POST', headers: { expect: '100-continue', 'content-length': body.length, 'content-type': 'application/octet-stream' },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('continue', () => req.end(body));
+    req.on('error', reject);
+  });
+  assert.equal(status, 201);
+  assert.equal(calls[0].body.length, 64 * 1024);
+  assert.equal(calls[0].headers.expect, undefined);
+});
