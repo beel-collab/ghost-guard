@@ -4,7 +4,9 @@ import http from 'node:http';
 import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import worker, { ghostBasePath } from '../src/worker.js';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import worker, { readsRequestBody } from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
 import { LocalLabelQueue } from '../src/webhook.js';
 
@@ -85,7 +87,6 @@ function resolveClient(req, trust) {
 }
 
 export function createGuardServer(env = process.env) {
-  ghostBasePath(env); // Refuse to start with a GHOST_BASE_PATH that cannot match.
   const trust = proxyTrust(env);
   let warnedUntrusted = false;
   const workerEnv = {
@@ -104,18 +105,32 @@ export function createGuardServer(env = process.env) {
 
   return http.createServer(async (req, res) => {
     try {
-      const chunks = [];
-      let size = 0;
-      for await (const chunk of req) {
-        size += chunk.length;
-        if (size > 1024 * 1024) {
-          res.writeHead(413, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ errors: [{ message: 'Request is too large.' }] }));
-          return;
+      const method = req.method || 'GET';
+      const url = new URL(`http://${req.headers.host || 'localhost'}${req.url}`);
+      let body;
+      if (method !== 'GET' && method !== 'HEAD') {
+        if (readsRequestBody(url.pathname)) {
+          // ghost-guard parses these bodies itself, so cap and buffer them.
+          const chunks = [];
+          let size = 0;
+          for await (const chunk of req) {
+            size += chunk.length;
+            // Past the cap, keep reading but discard, so the client receives
+            // the 413 instead of a connection reset.
+            if (size <= 1024 * 1024) chunks.push(chunk);
+          }
+          if (size > 1024 * 1024) {
+            res.writeHead(413, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ errors: [{ message: 'Request is too large.' }] }));
+            return;
+          }
+          body = chunks.length ? Buffer.concat(chunks) : undefined;
+        } else {
+          // Everything else (Ghost Admin uploads, imports) streams through
+          // unbuffered; the proxy in front sets the size limit.
+          body = Readable.toWeb(req);
         }
-        chunks.push(chunk);
       }
-      const body = Buffer.concat(chunks);
       const headers = new Headers();
       for (const [key, value] of Object.entries(req.headers)) {
         if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value);
@@ -137,33 +152,38 @@ export function createGuardServer(env = process.env) {
       headers.set('X-Forwarded-Proto', trusted && ['http', 'https'].includes(forwardedProtocol)
         ? forwardedProtocol : socketProtocol);
       headers.set('Accept-Encoding', 'identity');
-      const method = req.method || 'GET';
-      const request = new Request(`http://${req.headers.host || 'localhost'}${req.url}`, {
-        method,
-        headers,
-        body: method === 'GET' || method === 'HEAD' || !body.length ? undefined : body,
-      });
+      const request = new Request(url, { method, headers, body, duplex: 'half' });
       const response = await worker.fetch(request, workerEnv);
-      const responseBody = method === 'HEAD' || response.body === null ? null : Buffer.from(await response.arrayBuffer());
       const responseHeaders = new Headers(response.headers);
       stripHopByHop(responseHeaders);
       const outgoing = Object.fromEntries(responseHeaders);
-      // Native fetch decodes these encodings but keeps their upstream headers.
-      // Normalize even if an origin ignores our Accept-Encoding: identity.
-      if (responseBody !== null) {
-        const encodings = (response.headers.get('content-encoding') || '').split(',').map((value) => value.trim().toLowerCase());
-        if (encodings.every((value) => ['gzip', 'x-gzip', 'deflate', 'br'].includes(value))) {
-          delete outgoing['content-encoding'];
-        }
-        outgoing['content-length'] = String(responseBody.length);
-      }
       const cookies = responseHeaders.getSetCookie();
       if (cookies.length) outgoing['set-cookie'] = cookies;
-      res.writeHead(response.status, outgoing);
-      res.end(responseBody ?? undefined);
+      // Native fetch decodes these encodings but keeps their upstream headers.
+      // An origin that ignores our Accept-Encoding: identity is rare; buffer
+      // that case to send a correct length, and stream everything else.
+      const encodings = (response.headers.get('content-encoding') || '').split(',').map((value) => value.trim().toLowerCase());
+      const decoded = encodings.every((value) => ['gzip', 'x-gzip', 'deflate', 'br'].includes(value));
+      if (method === 'HEAD' || response.body === null) {
+        res.writeHead(response.status, outgoing);
+        res.end();
+      } else if (decoded) {
+        const responseBody = Buffer.from(await response.arrayBuffer());
+        delete outgoing['content-encoding'];
+        outgoing['content-length'] = String(responseBody.length);
+        res.writeHead(response.status, outgoing);
+        res.end(responseBody);
+      } else {
+        res.writeHead(response.status, outgoing);
+        await pipeline(Readable.fromWeb(response.body), res);
+      }
     } catch (error) {
       // Avoid logging request URLs/bodies, which may contain magic-link tokens.
       console.error('ghost-guard proxy error:', error.message);
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
       res.writeHead(502, { 'content-type': 'text/plain' });
       res.end('signup-shield proxy error');
     }

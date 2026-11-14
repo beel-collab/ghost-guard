@@ -249,76 +249,71 @@ for (const [name, env] of [['an external origin', envFor()], ['same-zone routing
 
 // Ghost installed in a subfolder, e.g. example.com/blog.
 
-test('subfolder install: signups under the base path get Turnstile and quotas, in any case', async (t) => {
-  // Doubled slashes too: Express routes /blog//members/… and /blog/members//api/… to Ghost.
-  for (const path of ['/blog/members/api/send-magic-link/', '/Blog/Members/API/Send-Magic-Link', '/BLOG/members/api/send-magic-link', '/blog//members/api/send-magic-link', '/blog/members//api/send-magic-link']) {
-    const calls = mockFetch(t, { success: false });
-    const response = await worker.fetch(signup({}, { 'cf-turnstile-response': 'token' }, `https://blog.example${path}`), envFor({ GHOST_BASE_PATH: '/blog', TURNSTILE_SECRET: 'secret' }));
-    assert.equal(response.status, 400, path);
-    assert.equal(calls.verification.length, 1);
-    assert.equal(calls.origin.length, 0);
-    t.mock.restoreAll();
+const host = (request) => new URL(request.url).host;
+
+test('signup protection does not depend on the base path, including doubled slashes', async (t) => {
+  // Express routes /blog//members/… and /members//api/… to Ghost's handler.
+  const paths = ['/blog/members/api/send-magic-link/', '/Blog/Members/API/Send-Magic-Link', '/blog//members/api/send-magic-link',
+    '/blog/members//api/send-magic-link', '/members//api/send-magic-link', '//members/api/send-magic-link/'];
+  for (const base of [undefined, '/blog', '/blgo', '/blog/..']) {
+    t.mock.method(console, 'error', () => {});
+    for (const path of paths) {
+      const calls = mockFetch(t, { success: false });
+      const response = await worker.fetch(signup({}, { 'cf-turnstile-response': 'token' }, `https://blog.example${path}`), envFor({ GHOST_BASE_PATH: base, TURNSTILE_SECRET: 'secret' }));
+      assert.equal(response.status, 400, `${base} ${path}`);
+      assert.equal(calls.verification.length, 1);
+      assert.equal(calls.origin.length, 0);
+      t.mock.restoreAll();
+    }
   }
 });
 
-test('subfolder install: magic links under the base path get the confirmation page', async (t) => {
+test('magic links get the confirmation page at any members path, whatever the base path', async (t) => {
   const calls = mockFetch(t);
-  const env = envFor({ GHOST_BASE_PATH: '/blog/' });
-  for (const url of ['https://blog.example/blog/members/?token=abc&action=signup', 'https://blog.example/Blog/Members?token=abc&action=subscribe']) {
-    const response = await worker.fetch(new Request(url), env);
-    assert.equal(response.status, 200);
-    assert.match(await response.text(), /Confirm signup/);
+  for (const base of [undefined, '/blog', '/blgo']) {
+    for (const url of ['https://blog.example/blog/members/?token=abc&action=signup', 'https://blog.example/Blog//Members?token=abc&action=subscribe', 'https://blog.example/members/?token=abc&action=signup']) {
+      const response = await worker.fetch(new Request(url), envFor({ GHOST_BASE_PATH: base }));
+      assert.equal(response.status, 200, `${base} ${url}`);
+      assert.match(await response.text(), /Confirm signup/);
+    }
   }
   assert.equal(calls.origin.length, 0);
   // The human confirmation is forwarded to Ghost at the subfolder path.
   await worker.fetch(new Request('https://blog.example/blog/members/?token=abc&action=signup', {
     method: 'POST', body: new URLSearchParams({ token: 'abc', action: 'signup' }),
-  }), env);
+  }), envFor({ GHOST_BASE_PATH: '/blog' }));
+  assert.equal(host(calls.origin[0]), 'origin.example');
   assert.equal(new URL(calls.origin[0].url).pathname, '/blog/members/');
 });
 
-test('subfolder install: paths outside it go to the zone origin untouched, not to Ghost', async (t) => {
+test('subfolder install: Ghost pages use GHOST_ORIGIN, the rest of the hostname its zone origin', async (t) => {
   const calls = mockFetch(t);
-  const env = envFor({ GHOST_BASE_PATH: 'blog', TURNSTILE_SECRET: 'secret' });
-  for (const url of ['https://blog.example/members/?token=abc&action=signup', 'https://blog.example/blogs/members/?token=abc&action=signup', 'https://blog.example/pricing']) {
-    assert.equal((await worker.fetch(new Request(url), env)).status, 201);
+  const env = envFor({ GHOST_BASE_PATH: 'blog' });
+  for (const path of ['/blog', '/blog/some-post/', '/BLOG/ghost/', '/pricing', '/blogs/x', '/']) {
+    await worker.fetch(new Request(`https://blog.example${path}`, { headers: { 'CF-Connecting-IP': '192.0.2.1', 'X-Forwarded-For': '203.0.113.7' } }), env);
   }
-  assert.equal((await worker.fetch(signup({}, {}, 'https://blog.example/members/api/send-magic-link/'), env)).status, 201);
-  assert.equal(calls.verification.length, 0);
-  // Same-zone fetches keep the public hostname; Ghost's own pages still use GHOST_ORIGIN.
-  assert.deepEqual(calls.origin.map((request) => new URL(request.url).host), ['blog.example', 'blog.example', 'blog.example', 'blog.example']);
-  await worker.fetch(new Request('https://blog.example/blog/some-post/'), env);
-  assert.equal(new URL(calls.origin[4].url).host, 'origin.example');
+  assert.deepEqual(calls.origin.map(host), ['origin.example', 'origin.example', 'origin.example', 'blog.example', 'blog.example', 'blog.example']);
+  assert.ok(calls.origin.every((request) => request.headers.get('x-forwarded-for') === '192.0.2.1'));
 });
 
-test('root install: doubled slashes cannot skip signup protection', async (t) => {
-  const calls = mockFetch(t, { success: false });
-  for (const path of ['/members//api/send-magic-link', '//members/api/send-magic-link/', '/members/api//send-magic-link']) {
-    const response = await worker.fetch(signup({}, { 'cf-turnstile-response': 'token' }, `https://blog.example${path}`), envFor({ TURNSTILE_SECRET: 'secret' }));
-    assert.equal(response.status, 400, path);
-  }
-  assert.equal(calls.origin.length, 0);
-  assert.equal((await worker.fetch(new Request('https://blog.example//members/?token=abc&action=signup'), envFor())).status, 200);
+test('an invalid base path keeps the rest of the site on its zone origin and logs once', async (t) => {
+  const calls = mockFetch(t);
+  const errors = t.mock.method(console, 'error', () => {});
+  const env = envFor({ GHOST_BASE_PATH: '/blog/..' });
+  await worker.fetch(new Request('https://blog.example/about/'), env);
+  await worker.fetch(new Request('https://blog.example/blog/post/'), env);
+  assert.deepEqual(calls.origin.map(host), ['blog.example', 'blog.example']);
+  assert.ok(errors.mock.callCount() <= 1);
+  // The sidecar has no zone origin: it always uses GHOST_ORIGIN.
+  await worker.fetch(new Request('https://blog.example/about/'), { ...env, SIDECAR: true });
+  assert.equal(host(calls.origin[2]), 'origin.example');
 });
 
-test('GHOST_BASE_PATH is normalized, and an invalid value fails closed', async (t) => {
-  for (const [value, expected] of [[undefined, ''], ['', ''], ['/', ''], ['blog', '/blog'], ['/Blog/', '/blog'], [' /news/blog// ', '/news/blog'], ['/actualit%C3%A9s', '/actualit%c3%a9s']]) {
+test('GHOST_BASE_PATH is normalized and rejects values a path could never match', () => {
+  for (const [value, expected] of [[undefined, ''], ['', ''], ['/', ''], ['blog', '/blog'], ['/Blog/', '/blog'], [' /news/blog// ', '/news/blog'], ['/actualit%C3%A9s', '/actualit%c3%a9s'], ['/news+views', '/news+views']]) {
     assert.equal(ghostBasePath({ GHOST_BASE_PATH: value }), expected);
   }
-  const calls = mockFetch(t);
-  // Values a request path can never match must fail closed, not silently open.
   for (const value of ['/blog?x=1', '/blog#top', '/my blog', 'https://example.com/blog', '/..', '/blog/..', '.', '/./blog', '/blog//x', '/blog%']) {
     assert.throws(() => ghostBasePath({ GHOST_BASE_PATH: value }), /GHOST_BASE_PATH/, value);
-    const errors = t.mock.method(console, 'error', () => {});
-    const response = await worker.fetch(signup(), envFor({ GHOST_BASE_PATH: value }));
-    assert.equal(response.status, 500);
-    assert.doesNotMatch(await response.text(), /GHOST_BASE_PATH/);
-    assert.equal(errors.mock.callCount(), 1);
-    assert.equal((await worker.fetch(new Request('https://blog.example/blog/members/?token=abc&action=signup'), envFor({ GHOST_BASE_PATH: value }))).status, 500);
-    errors.mock.restore();
   }
-  assert.equal(calls.origin.length, 0);
-  // The rest of the site keeps working with a broken setting.
-  assert.equal((await worker.fetch(new Request('https://blog.example/about/'), envFor({ GHOST_BASE_PATH: '/blog/..' }))).status, 201);
-  assert.equal(calls.origin.length, 1);
 });

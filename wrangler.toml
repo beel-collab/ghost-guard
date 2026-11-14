@@ -33,8 +33,9 @@ new_sqlite_classes = ["MemberLabeller"]
 [vars]
 INTERSTITIAL_ACTIONS = "signup,subscribe,signup-paid"
 SITE_TITLE = "this publication"
-# Subfolder Ghost is installed in; leave unset for the domain root. Set it
-# here, not only in the dashboard: wrangler deploy replaces dashboard vars.
+# With GHOST_ORIGIN set and Ghost in a subfolder: other paths go to the zone
+# origin instead. Set it here, not only in the dashboard: wrangler deploy
+# replaces dashboard vars. Signup protection does not depend on it.
 # GHOST_BASE_PATH = "/blog"
 # TURNSTILE_SECRET enables signup challenges. Put the public sitekey in the
 # Code Injection snippet, not here. Hostname defaults to the request hostname.

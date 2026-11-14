@@ -268,21 +268,47 @@ test('forwarded headers from an unlisted peer log one warning', async (t) => {
   assert.match(String(warnings.mock.calls[0].arguments), /127\.0\.0\.1.*TRUSTED_PROXIES/);
 });
 
-test('sidecar protects a subfolder install end to end and refuses an invalid base path', async (t) => {
-  const { guard, calls } = await setup(t, { GHOST_BASE_PATH: '/blog', SIGNUP_IP_LIMIT: '1' });
-  const post = (email) => fetch(`${guard}/blog/members/api/send-magic-link/`, {
+test('sidecar protects a subfolder install end to end with no base path setting', async (t) => {
+  const { guard, calls } = await setup(t, { SIGNUP_IP_LIMIT: '1' });
+  const post = (email, path = '/blog/members/api/send-magic-link/') => fetch(`${guard}${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, emailType: 'signup' }),
   });
   assert.equal((await post('reader@work.example')).status, 201);
-  assert.equal((await post('other@work.example')).status, 429);
+  assert.equal((await post('other@work.example', '/blog//members/api/send-magic-link')).status, 429);
   const page = await fetch(`${guard}/blog/members/?token=abc&action=signup`);
   assert.match(await page.text(), /Confirm signup/);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, '/blog/members/api/send-magic-link/');
-  // Paths outside the subfolder still go to GHOST_ORIGIN; the sidecar has no other origin.
+  // Everything else, inside or outside the subfolder, goes to GHOST_ORIGIN.
   assert.equal((await fetch(`${guard}/pricing`)).status, 201);
   assert.equal(calls[1].url, '/pricing');
-  for (const bad of ['/blog?x', '/blog/..', '/blog//x']) {
-    assert.throws(() => createGuardServer({ GHOST_BASE_PATH: bad }), /GHOST_BASE_PATH/);
+});
+
+test('sidecar streams Ghost Admin uploads and large responses, and caps only bodies it reads', async (t) => {
+  const big = Buffer.alloc(3 * 1024 * 1024, 'a');
+  const received = [];
+  const origin = await listen(t, http.createServer(async (req, res) => {
+    let size = 0;
+    for await (const chunk of req) size += chunk.length;
+    received.push({ url: req.url, size });
+    if (req.url === '/blog/content/media/video.mp4') {
+      res.writeHead(200, { 'content-type': 'video/mp4', 'content-length': String(big.length) });
+      res.end(big);
+      return;
+    }
+    res.writeHead(201, { 'content-type': 'application/json' });
+    res.end('{}');
+  }));
+  const guard = await listen(t, createGuardServer({ GHOST_ORIGIN: origin }));
+  const upload = await fetch(`${guard}/blog/ghost/api/admin/images/upload/`, { method: 'POST', body: big, headers: { 'content-type': 'application/octet-stream' } });
+  assert.equal(upload.status, 201);
+  assert.deepEqual(received[0], { url: '/blog/ghost/api/admin/images/upload/', size: big.length });
+  const media = await fetch(`${guard}/blog/content/media/video.mp4`);
+  assert.equal(media.headers.get('content-length'), String(big.length));
+  assert.equal((await media.arrayBuffer()).byteLength, big.length);
+  for (const path of ['/blog/members/api/send-magic-link/', '/members/?token=abc&action=signup', '/signup-shield/webhooks/member-added']) {
+    const response = await fetch(`${guard}${path}`, { method: 'POST', body: big, headers: { 'content-type': 'application/json' } });
+    assert.equal(response.status, 413, path);
   }
+  assert.equal(received.length, 2);
 });

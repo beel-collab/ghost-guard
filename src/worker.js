@@ -21,19 +21,7 @@ const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    let base;
-    try {
-      base = ghostBasePath(env);
-    } catch (error) {
-      // Fail closed where protection is at stake: anything that could be a
-      // members route. The rest of the site keeps working.
-      if (/\/members(\/|$)/.test(canonicalPath(url.pathname))) {
-        console.error(`ghost-guard: ${error.message}`);
-        return new Response('Signups are temporarily unavailable.', { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } });
-      }
-      base = '';
-    }
-    const local = ghostPath(url, base);
+    const path = canonicalPath(url.pathname);
 
     if (url.pathname === '/ghost-guard/turnstile.js') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -42,7 +30,10 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    if (local === '/members/api/send-magic-link' && request.method === 'POST') {
+    // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
+    // serves these under <subfolder>/members, and covering a lookalike path
+    // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
+    if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
       return handleSendMagicLink(request, env);
     }
 
@@ -50,14 +41,14 @@ export default {
       return handleMemberAddedWebhook(request, env);
     }
 
-    if (local === '/members' && url.searchParams.has('token')) {
+    if (path.endsWith('/members') && url.searchParams.has('token')) {
       return handleMagicLink(request, url, env);
     }
 
     // Outside a subfolder install the path belongs to whatever else serves this
-    // hostname, so send it to the zone's normal origin, not to Ghost. The
-    // sidecar has no zone origin and only receives Ghost's paths anyway.
-    if (local === null && !env.SIDECAR) return forwardToOrigin(request, { ...env, GHOST_ORIGIN: '' });
+    // hostname, so it goes to the zone's normal origin, not to Ghost. The
+    // sidecar has no zone origin; nginx only sends it Ghost's paths.
+    if (env.SIDECAR !== true && !insideGhost(path, env)) return forwardToZone(request);
     return forwardToOrigin(request, env);
   },
 };
@@ -121,14 +112,40 @@ function portalError(message, status, headers = {}) {
 // GHOST_BASE_PATH: the subfolder Ghost is installed under (e.g. "/blog" for
 // example.com/blog), or empty for the domain root. Returned lowercased with a
 // leading slash and no trailing one, since Ghost's routes ignore case.
-// Rejects anything a request path could never match (dot or empty segments,
-// query or fragment characters), so a typo fails closed instead of open.
+// Only routing depends on this: protection is decided by path suffix. Values a
+// request path could never match (dot or empty segments, query characters)
+// are rejected rather than silently misrouting.
 export function ghostBasePath(env) {
   const path = String(env.GHOST_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
   if (!path) return '';
-  const valid = path.split('/').every((segment) => /^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$/.test(segment) && segment !== '.' && segment !== '..');
+  const valid = path.split('/').every((segment) => /^(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+$/.test(segment) && segment !== '.' && segment !== '..');
   if (!valid) throw new Error('GHOST_BASE_PATH must be a plain path such as /blog');
   return `/${path.toLowerCase()}`;
+}
+
+let warnedBasePath = false;
+
+// With an invalid base path nothing is treated as Ghost's, so every page goes
+// to the zone's normal origin: a separate root site keeps working, and
+// signups stay protected because protection does not depend on the base.
+function insideGhost(path, env) {
+  let base;
+  try {
+    base = ghostBasePath(env);
+  } catch (error) {
+    if (!warnedBasePath) {
+      warnedBasePath = true;
+      console.error(`ghost-guard: ${error.message}; sending pages to the zone origin`);
+    }
+    return false;
+  }
+  return !base || path === base || path.startsWith(`${base}/`);
+}
+
+// The sidecar buffers and size-limits only the bodies ghost-guard reads.
+export function readsRequestBody(pathname) {
+  const path = canonicalPath(pathname);
+  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/');
 }
 
 // Lowercased, without trailing slashes, and with repeated slashes collapsed:
@@ -138,13 +155,6 @@ function canonicalPath(pathname) {
   return pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
-// The request path relative to the Ghost install, or null when the request is
-// outside the install.
-function ghostPath(url, base) {
-  const path = canonicalPath(url.pathname);
-  if (base && path !== base && !path.startsWith(`${base}/`)) return null;
-  return path.slice(base.length) || '/';
-}
 
 function interstitialActions(env) {
   const raw = env.INTERSTITIAL_ACTIONS || DEFAULT_ACTIONS;
@@ -235,6 +245,15 @@ function originForwardHeaders(request, env) {
   return headers;
 }
 
+// The hostname's normal Cloudflare origin, as if the Worker were not routed.
+function forwardToZone(request) {
+  const clientIp = request.headers.get('CF-Connecting-IP');
+  if (!clientIp) return fetch(request);
+  const headers = new Headers(request.headers);
+  headers.set('X-Forwarded-For', clientIp);
+  return fetch(new Request(request, { headers }));
+}
+
 async function forwardToOrigin(request, env) {
   // Ghost trusts every proxy and takes the leftmost X-Forwarded-For entry as the
   // client, and Cloudflare only appends to what the client sent. Replace the
@@ -242,13 +261,9 @@ async function forwardToOrigin(request, env) {
   // cannot dodge Ghost's per-IP throttling, which is all that limits sign-ins.
   const clientIp = request.headers.get('CF-Connecting-IP');
   const origin = (env.GHOST_ORIGIN || '').replace(/\/+$/, '');
-  if (!origin) {
-    // Same-zone routing: the bypass header (set by confirmAndForward) prevents a loop.
-    if (!clientIp) return fetch(request);
-    const sameZoneHeaders = new Headers(request.headers);
-    sameZoneHeaders.set('X-Forwarded-For', clientIp);
-    return fetch(new Request(request, { headers: sameZoneHeaders }));
-  }
+  // Without GHOST_ORIGIN, Ghost is the zone origin; same-zone subrequests do
+  // not re-enter this Worker.
+  if (!origin) return forwardToZone(request);
 
   const url = new URL(request.url);
   // Assign URL components so a leading // in the path cannot change authority.
