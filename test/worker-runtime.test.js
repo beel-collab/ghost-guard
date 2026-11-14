@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHmac } from 'node:crypto';
 
 test('Wrangler runtime serves assets and atomically enforces Durable Object quotas', { timeout: 60000 }, async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'ghost-guard-runtime-'));
@@ -14,8 +15,32 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
   process.env.WRANGLER_SEND_METRICS = 'false';
   const { unstable_dev } = await import('wrangler');
   let forwarded = 0;
+  const memberId = '111111111111111111111111';
+  const reviewLabel = { id: '222222222222222222222222', name: 'signup-shield-review' };
+  const labels = [];
+  let labelWrites = 0;
   const origin = http.createServer(async (req, res) => {
     for await (const chunk of req) { void chunk; }
+    if (req.url.startsWith('/ghost/api/admin/')) {
+      res.setHeader('content-type', 'application/json');
+      if (req.url.startsWith(`/ghost/api/admin/members/${memberId}/`)) {
+        const snapshot = { id: memberId, email: 'reader@work.example', status: 'free', labels: structuredClone(labels) };
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        res.end(JSON.stringify({ members: [snapshot] }));
+      } else if (req.url.startsWith('/ghost/api/admin/labels/')) {
+        res.end(JSON.stringify({ labels: [reviewLabel] }));
+      } else if (req.url.startsWith('/ghost/api/admin/members/bulk/')) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        // Match Ghost: every addLabel inserts a new physical relation.
+        labels.push(reviewLabel);
+        labelWrites++;
+        res.end(JSON.stringify({ bulk: { meta: { stats: { successful: 1, unsuccessful: 0 } } } }));
+      } else {
+        res.writeHead(404);
+        res.end('{}');
+      }
+      return;
+    }
     forwarded++;
     res.writeHead(201, { 'content-type': 'application/json' });
     res.end('{}');
@@ -26,7 +51,11 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
   const dev = await unstable_dev('src/worker.js', {
     config: 'wrangler.toml', ip: '127.0.0.1', port: 0, inspectorPort: 0,
     local: true, persist: false, logLevel: 'error',
-    vars: { GHOST_ORIGIN: `http://127.0.0.1:${origin.address().port}` },
+    vars: {
+      GHOST_ORIGIN: `http://127.0.0.1:${origin.address().port}`,
+      CLEANUP_ENABLED: 'true', ADMIN_API_URL: `http://127.0.0.1:${origin.address().port}`,
+      ADMIN_API_KEY: 'id:0123456789abcdef', WEBHOOK_SECRET: 'webhook-secret',
+    },
     experimental: { disableExperimentalWarning: true, disableDevRegistry: true, watch: false },
   });
   t.after(() => dev.stop());
@@ -49,4 +78,17 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
   assert.equal(page.status, 200);
   assert.doesNotMatch(await page.text(), /<script|turnstile|\.submit\(/i);
   assert.equal(forwarded, 6);
+
+  const body = JSON.stringify({ member: { current: { id: memberId, email: 'reader@work.example' } } });
+  const timestamp = String(Date.now());
+  const hash = createHmac('sha256', 'webhook-secret').update(body + timestamp).digest('hex');
+  const deliveries = await Promise.all(Array.from({ length: 10 }, () => dev.fetch('/signup-shield/webhooks/member-added', {
+    method: 'POST', body, headers: { 'X-Ghost-Signature': `sha256=${hash}, t=${timestamp}` },
+  })));
+  assert.ok(deliveries.every((response) => response.status === 200));
+  const results = await Promise.all(deliveries.map((response) => response.json()));
+  assert.equal(results.filter((result) => result.action === 'label').length, 1);
+  assert.equal(results.filter((result) => result.skipped === 'already-labelled').length, 9);
+  assert.equal(labelWrites, 1);
+  assert.equal(labels.length, 1);
 });

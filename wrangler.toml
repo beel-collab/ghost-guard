@@ -16,9 +16,17 @@ run_worker_first = true
 name = "SIGNUP_RATE_LIMITER"
 class_name = "SignupRateLimiter"
 
+[[durable_objects.bindings]]
+name = "MEMBER_LABELLER"
+class_name = "MemberLabeller"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SignupRateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MemberLabeller"]
 
 # Secrets: CONFIRM_SECRET, GHOST_ORIGIN, TURNSTILE_SECRET,
 # ADMIN_API_KEY and WEBHOOK_SECRET. Never commit real secrets.

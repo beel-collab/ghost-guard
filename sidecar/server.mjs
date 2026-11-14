@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import worker from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
+import { MemberQueue } from '../src/webhook.js';
 
 const script = await readFile(new URL('../public/ghost-guard/turnstile.js', import.meta.url), 'utf8');
 
@@ -20,6 +21,7 @@ export function createGuardServer(env = process.env) {
     ...env,
     GHOST_ORIGIN: (env.GHOST_ORIGIN || 'http://127.0.0.1:2368').replace(/\/+$/, ''),
     LOCAL_RATE_LIMITER: new MemoryRateLimiter(),
+    LOCAL_MEMBER_LABELLER: new MemberQueue(),
     ASSETS: {
       fetch: async (request) => new Response(request.method === 'HEAD' ? null : script, {
         headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=300', 'x-content-type-options': 'nosniff' },

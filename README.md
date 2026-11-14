@@ -29,7 +29,7 @@ npx wrangler deploy
 
 Use a long random `CONFIRM_SECRET`. Set `GHOST_ORIGIN` to a direct, DNS-only Ghost origin such as `https://origin.example.com`. The confirmation request includes the secret as `X-Ghost-Signup-Shield` to avoid intercepting its own follow-up request. A direct origin is recommended; without one the Worker uses same-zone forwarding. Restrict direct origin access to your proxy so attackers cannot bypass it.
 
-`wrangler.toml` includes the static asset binding, Durable Object binding, and first SQLite migration. There is no KV namespace to create. Set `SITE_TITLE` and quotas in `[vars]` before deploying.
+`wrangler.toml` includes the static asset binding, the signup limiter and member labeller Durable Object bindings, and their `v1`/`v2` migrations. Deploy with this configuration when upgrading so the new labeller binding is present; a missing binding fails closed when the webhook is enabled. There is no KV namespace to create. Set `SITE_TITLE` and quotas in `[vars]` before deploying.
 
 In Cloudflare **Workers & Pages → ghost-guard → Settings/Triggers → Routes**, attach:
 
@@ -145,6 +145,8 @@ https://YOUR-WORKER.workers.dev/signup-shield/webhooks/member-added
 
 Use the same `WEBHOOK_SECRET` in Ghost. Its signature is required and checked with a five-minute timestamp tolerance. `ADMIN_API_KEY` is the integration's `id:secret` Admin API key. The labeller reads the current member before checking status, email domain, or an existing review label, rather than trusting the creation-time snapshot. It uses Ghost 6's Admin API label endpoints and the additive `members/bulk` `addLabel` operation, filtered to that member's ID and free status. Other labels are never replaced, including labels added concurrently. The review label is created when missing. Replayed events and concurrent duplicate deliveries are handled without adding a second review label; failed operations return 503 so delivery can be retried. The sidecar supports the same webhook settings if you need it for a self-hosted site.
 
+The Worker routes each member's deliveries through the same **`MemberLabeller` Durable Object**. It serializes the entire current-member read and additive write, so overlapping deliveries cannot both observe an absent review label and insert it. Different members proceed independently. The sidecar uses the same queue logic **within one process**. Send webhooks to one sidecar process, or use the Worker labeller for multiple sidecar replicas; separate processes/deployments do not share these queues. This coordinates deliveries handled by this deployment, not other integrations independently editing the same label.
+
 `CLEANUP_MODE` and `CLEANUP_LABEL` have been removed. Even a leftover `CLEANUP_MODE=unsubscribe` cannot enable automatic unsubscribing. Without `CLEANUP_SKIP_DOMAINS`, all new free members are eligible for review; the supplied Worker config includes common consumer domains. Webhook labelling does not prevent creation or establish that a signup is spam.
 
 ## Configuration
@@ -162,6 +164,7 @@ Use the same `WEBHOOK_SECRET` in Ghost. Its signature is required and checked wi
 | `SIGNUP_EMAIL_LIMIT` | `3` | Allowed signup attempts per normalized email/window |
 | `SIGNUP_EMAIL_WINDOW_SECONDS` | `86400` | Email window in seconds |
 | `SIGNUP_RATE_LIMITER` | Wrangler binding | SQLite Durable Object namespace, Worker only |
+| `MEMBER_LABELLER` | Wrangler binding | Shared per-member webhook serialization, Worker only |
 | `ASSETS` | Wrangler binding | Serves the injection script, Worker only |
 | `PORT` | `8787` | Sidecar listening port |
 | `TRUST_PROXY` | `false` | Sidecar only: trust overwritten X-Forwarded-For and X-Forwarded-Proto from your proxy |
