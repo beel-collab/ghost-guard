@@ -13,9 +13,10 @@ services:
       SIGNUP_EMAIL_LIMIT: ${SIGNUP_EMAIL_LIMIT:-3}
       SIGNUP_EMAIL_WINDOW_SECONDS: ${SIGNUP_EMAIL_WINDOW_SECONDS:-86400}
       # Peers allowed to set X-Forwarded-For/-Proto: loopback and Docker's
-      # private ranges, where a host or container proxy connects from. Narrow
-      # this to your proxy's address if untrusted containers share the network.
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12,192.168.0.0/16}
+      # default bridge ranges, where a host or container proxy connects from.
+      # Narrow this to your proxy's address if untrusted containers share the
+      # network. Avoid listing ranges your readers connect from, such as a LAN.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12}
     ports:
       - "127.0.0.1:8787:8787"
     # Attach this service to the same Docker network as Ghost.

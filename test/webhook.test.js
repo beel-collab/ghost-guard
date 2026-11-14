@@ -216,6 +216,14 @@ for (const [name, config] of [
   });
 }
 
+test('unsigned requests learn nothing about the Admin API configuration', async (t) => {
+  ghost(t);
+  const unsigned = new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
+  const response = await worker.fetch(unsigned, { ...env, ADMIN_API_KEY: 'id:secret', LOCAL_MEMBER_LABELLER: new LocalLabelQueue([]) });
+  assert.equal(response.status, 401);
+  assert.doesNotMatch(await response.text(), /ADMIN_API/);
+});
+
 test('sidecar does not retry errors that retrying cannot fix', async (t) => {
   const state = ghost(t);
   state.readStatus = 401;

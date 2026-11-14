@@ -60,20 +60,33 @@ function proxyTrust(env) {
   return { peer: () => false, hop: () => false };
 }
 
+// Some proxies append "ip:port" or "[ipv6]:port"; keep only the address.
+function forwardedAddress(entry) {
+  const value = plainAddress(entry);
+  return plainAddress(value.match(/^\[([^\]]+)\](?::\d+)?$/)?.[1] ?? value.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/)?.[1] ?? value);
+}
+
 // Walk X-Forwarded-For from the right past our own proxies; the first other
-// entry is the client. Untrusted peers are the client themselves.
+// entry is the client. Untrusted peers are the client themselves. An entry
+// that is not an IP address falls back to the peer, so junk never becomes a
+// fresh rate-limit bucket.
 function resolveClient(req, trust) {
   const peer = plainAddress(req.socket.remoteAddress);
   if (!trust.peer(peer)) return { ip: peer, trusted: false };
-  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(plainAddress).filter(Boolean);
+  const hops = String(req.headers['x-forwarded-for'] || '').split(',').map(forwardedAddress).filter(Boolean);
+  let client = hops[0];
   for (let i = hops.length - 1; i >= 0; i--) {
-    if (!trust.hop(hops[i])) return { ip: hops[i], trusted: true };
+    if (!trust.hop(hops[i])) {
+      client = hops[i];
+      break;
+    }
   }
-  return { ip: hops[0] || peer, trusted: true };
+  return { ip: net.isIP(client || '') ? client : peer, trusted: true };
 }
 
 export function createGuardServer(env = process.env) {
   const trust = proxyTrust(env);
+  let warnedUntrusted = false;
   const workerEnv = {
     ...env,
     GHOST_ORIGIN: (env.GHOST_ORIGIN || 'http://127.0.0.1:2368').replace(/\/+$/, ''),
@@ -105,6 +118,12 @@ export function createGuardServer(env = process.env) {
         if (value) headers.set(key, Array.isArray(value) ? value.join(', ') : value);
       }
       const { ip, trusted } = resolveClient(req, trust);
+      // Forwarded headers from an unlisted peer usually mean TRUSTED_PROXIES is
+      // missing or wrong, which silently puts every reader in one IP bucket.
+      if (!trusted && !warnedUntrusted && (req.headers['x-forwarded-for'] || req.headers['x-forwarded-proto'])) {
+        warnedUntrusted = true;
+        console.warn(`ghost-guard: ignoring X-Forwarded-For/-Proto from ${ip}, which is not in TRUSTED_PROXIES; if it is your reverse proxy, add it, or every reader shares one IP quota`);
+      }
       stripHopByHop(headers);
       headers.delete('content-length');
       headers.set('CF-Connecting-IP', ip || 'unknown');

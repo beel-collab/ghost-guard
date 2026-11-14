@@ -244,3 +244,26 @@ test('legacy TRUST_PROXY=true warns at startup', (t) => {
   createGuardServer({ TRUST_PROXY: 'true' });
   assert.match(String(warnings.mock.calls[0].arguments), /TRUSTED_PROXIES/);
 });
+
+test('TRUSTED_PROXIES: ports are stripped and junk entries fall back to the peer', async (t) => {
+  const { guard, calls } = await setup(t, { TRUSTED_PROXIES: '127.0.0.1' });
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': '192.0.2.1:5555' });
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': '[2001:db8::1]:443' });
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': 'unknown' });
+  assert.deepEqual(calls.map((call) => call.headers['x-forwarded-for']), ['192.0.2.1', '2001:db8::1', '127.0.0.1']);
+});
+
+test('a port in X-Forwarded-For does not create a fresh IP quota', async (t) => {
+  const { guard } = await setup(t, { SIGNUP_IP_LIMIT: '1', TRUSTED_PROXIES: '127.0.0.1' });
+  assert.equal((await send(guard, {}, { 'X-Forwarded-For': '192.0.2.1:1000' })).status, 201);
+  assert.equal((await send(guard, { email: 'other@work.example' }, { 'X-Forwarded-For': '192.0.2.1:2000' })).status, 429);
+});
+
+test('forwarded headers from an unlisted peer log one warning', async (t) => {
+  const warnings = t.mock.method(console, 'warn', () => {});
+  const { guard } = await setup(t, { TRUSTED_PROXIES: '10.0.0.1' });
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': '192.0.2.1' });
+  await send(guard, { emailType: 'signin' }, { 'X-Forwarded-Proto': 'https' });
+  assert.equal(warnings.mock.callCount(), 1);
+  assert.match(String(warnings.mock.calls[0].arguments), /127\.0\.0\.1.*TRUSTED_PROXIES/);
+});

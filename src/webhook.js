@@ -132,16 +132,15 @@ export async function handleMemberAddedWebhook(request, env) {
   if (!env.ADMIN_API_URL || !env.ADMIN_API_KEY || !env.WEBHOOK_SECRET) {
     return json({ ok: false, error: 'admin api and webhook secret must be configured' }, 503);
   }
-  // Labelling runs after the 202, so report settings that can never work now,
-  // where Ghost Admin's webhook status shows them.
-  const configError = adminConfigError(env);
-  if (configError) return json({ ok: false, error: configError }, 503);
-
   const raw = await request.text();
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
   if (!valid) {
     return json({ ok: false, error: 'invalid signature' }, 401);
   }
+  // Labelling runs after the 202, so report settings that can never work now,
+  // where Ghost Admin's webhook status shows them. Only signed requests see this.
+  const configError = adminConfigError(env);
+  if (configError) return json({ ok: false, error: configError }, 503);
 
   let payload;
   try {
