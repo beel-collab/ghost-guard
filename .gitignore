@@ -1,2 +1,10 @@
 node_modules/
 .wrangler/
+
+# Local secrets: Wrangler dev vars and dotenv files (keep committed examples).
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+!.dev.vars.example
