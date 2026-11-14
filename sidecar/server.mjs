@@ -8,6 +8,13 @@ import { MemoryRateLimiter } from '../src/rate-limit.js';
 
 const script = await readFile(new URL('../public/ghost-guard/turnstile.js', import.meta.url), 'utf8');
 
+function stripHopByHop(headers) {
+  const nominated = (headers.get('connection') || '').split(',').map((name) => name.trim()).filter(Boolean);
+  for (const name of [...nominated, 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']) {
+    headers.delete(name);
+  }
+}
+
 export function createGuardServer(env = process.env) {
   const workerEnv = {
     ...env,
@@ -42,7 +49,10 @@ export function createGuardServer(env = process.env) {
       const ip = env.TRUST_PROXY === 'true'
         ? String(req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',')[0].trim()
         : req.socket.remoteAddress;
+      stripHopByHop(headers);
+      headers.delete('content-length');
       headers.set('CF-Connecting-IP', ip || 'unknown');
+      headers.set('X-Forwarded-For', ip || 'unknown');
       headers.delete('X-Ghost-Signup-Shield');
       const socketProtocol = req.socket.encrypted ? 'https' : 'http';
       const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').trim().toLowerCase();
@@ -57,7 +67,9 @@ export function createGuardServer(env = process.env) {
       });
       const response = await worker.fetch(request, workerEnv);
       const responseBody = method === 'HEAD' || response.body === null ? null : Buffer.from(await response.arrayBuffer());
-      const outgoing = Object.fromEntries(response.headers);
+      const responseHeaders = new Headers(response.headers);
+      stripHopByHop(responseHeaders);
+      const outgoing = Object.fromEntries(responseHeaders);
       // Native fetch decodes these encodings but keeps their upstream headers.
       // Normalize even if an origin ignores our Accept-Encoding: identity.
       if (responseBody !== null) {
@@ -67,8 +79,7 @@ export function createGuardServer(env = process.env) {
         }
         outgoing['content-length'] = String(responseBody.length);
       }
-      delete outgoing['transfer-encoding'];
-      const cookies = response.headers.getSetCookie();
+      const cookies = responseHeaders.getSetCookie();
       if (cookies.length) outgoing['set-cookie'] = cookies;
       res.writeHead(response.status, outgoing);
       res.end(responseBody ?? undefined);

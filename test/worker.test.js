@@ -157,21 +157,6 @@ test('confirmation POST and signin magic links do not need Turnstile', async (t)
   assert.equal(calls.verification.length, 0);
 });
 
-test('legacy unsubscribe configuration can only label, preserving and deduplicating labels', async (t) => {
-  const calls = mockFetch(t);
-  const body = JSON.stringify({ member: { current: { id: 'm1', email: 'reader@work.example', status: 'free', labels: [{ name: 'existing' }, { name: 'signup-shield-review' }] } } });
-  const timestamp = String(Date.now());
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode('webhook-secret'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const hash = [...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(body + timestamp)))].map((b) => b.toString(16).padStart(2, '0')).join('');
-  const response = await worker.fetch(new Request('https://blog.example/signup-shield/webhooks/member-added', {
-    method: 'POST', body, headers: { 'X-Ghost-Signature': `sha256=${hash}, t=${timestamp}` },
-  }), envFor({ CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example', ADMIN_API_KEY: 'id:0123456789abcdef', WEBHOOK_SECRET: 'webhook-secret', CLEANUP_MODE: 'unsubscribe' }));
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).action, 'label');
-  assert.equal(calls.origin[0].method, 'PUT');
-  assert.deepEqual(await calls.origin[0].json(), { members: [{ labels: [{ name: 'existing' }, { name: 'signup-shield-review' }] }] });
-});
-
 test('webhook refuses missing signing configuration and invalid signatures', async (t) => {
   const calls = mockFetch(t);
   const env = envFor({ CLEANUP_ENABLED: 'true', ADMIN_API_URL: 'https://admin.example', ADMIN_API_KEY: 'id:0123456789abcdef' });

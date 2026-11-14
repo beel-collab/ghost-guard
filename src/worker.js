@@ -15,6 +15,7 @@ export { SignupRateLimiter } from './rate-limit.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
 const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
+const REVIEW_LABEL = 'signup-shield-review';
 
 export default {
   async fetch(request, env) {
@@ -342,14 +343,40 @@ async function handleMemberAddedWebhook(request, env) {
   // Ghost webhook payload is { event, member: { current, previous } }
   // see ghost/core/server/services/webhooks/serialize.js
   const member =
-    payload.member?.current ||
-    payload.member ||
-    (Array.isArray(payload.members) ? payload.members[0] : null);
-  if (!member || !member.id || !member.email) {
+    payload?.member?.current ||
+    payload?.member ||
+    (Array.isArray(payload?.members) ? payload.members[0] : null);
+  if (typeof member?.id !== 'string' || !/^[a-f\d]{24}$/i.test(member.id)) {
     return json({ ok: false, error: 'no member in payload' }, 400);
   }
 
-  if (member.status && member.status !== 'free') {
+  try {
+    return await labelCurrentMember(env, member.id);
+  } catch {
+    // A non-2xx response makes delivery failures retryable; never acknowledge a
+    // failed or partially successful Admin API operation as completed.
+    return json({ ok: false, error: 'member labelling failed; please retry' }, 503);
+  }
+}
+
+async function readCurrentMember(env, id) {
+  try {
+    const data = await adminApiRequest(env, `members/${id}/`);
+    const member = data.members?.[0];
+    if (member?.id !== id || typeof member.email !== 'string') throw new Error('Invalid member response');
+    return member;
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function labelCurrentMember(env, id) {
+  // The event is a creation-time snapshot. Eligibility and replay detection
+  // must use current state, and label writes must be additive.
+  const member = await readCurrentMember(env, id);
+  if (!member) return json({ ok: true, skipped: 'member-missing' });
+  if (member.status !== 'free') {
     return json({ ok: true, skipped: 'not-free' });
   }
 
@@ -364,30 +391,63 @@ async function handleMemberAddedWebhook(request, env) {
     return json({ ok: true, skipped: 'consumer-domain' });
   }
 
-  await adminPatchMember(env, member, {
-    labels: [...new Set([...existingLabelNames(member), 'signup-shield-review'])].map((name) => ({ name })),
+  if (hasReviewLabel(member)) return json({ ok: true, skipped: 'already-labelled', id });
+  const label = await getReviewLabel(env);
+  const query = new URLSearchParams({ filter: `id:'${id}'+status:free` });
+  const result = await adminApiRequest(env, `members/bulk/?${query}`, {
+    method: 'PUT', body: { bulk: { action: 'addLabel', meta: { label: { id: label.id } } } },
   });
-  return json({ ok: true, action: 'label', id: member.id });
+  const stats = result.bulk?.meta?.stats;
+  if (stats?.successful === 1 && stats.unsuccessful === 0) return json({ ok: true, action: 'label', id });
+
+  // Concurrent deliveries may both try to add the same relation. Ghost reports
+  // bulk failures inside HTTP 200; only accept them if the label is now present.
+  const current = await readCurrentMember(env, id);
+  if (!current) return json({ ok: true, skipped: 'member-missing' });
+  if (current.status !== 'free') return json({ ok: true, skipped: 'not-free' });
+  if (hasReviewLabel(current)) return json({ ok: true, skipped: 'already-labelled', id });
+  throw new Error('Ghost did not apply the review label');
 }
 
-function existingLabelNames(member) {
-  if (!Array.isArray(member.labels)) return [];
-  return member.labels.map((l) => l.name).filter(Boolean);
+function hasReviewLabel(member) {
+  return Array.isArray(member.labels) && member.labels.some((label) => label.name === REVIEW_LABEL);
 }
 
-async function adminPatchMember(env, member, body) {
+async function getReviewLabel(env) {
+  const query = new URLSearchParams({ filter: `name:'${REVIEW_LABEL}'`, limit: '1' });
+  const find = async () => (await adminApiRequest(env, `labels/?${query}`)).labels?.[0];
+  let label = await find();
+  if (!label) {
+    try {
+      label = (await adminApiRequest(env, 'labels/', { method: 'POST', body: { labels: [{ name: REVIEW_LABEL }] } })).labels?.[0];
+    } catch (error) {
+      // Another delivery may have created the named label between GET and POST.
+      if (![409, 422].includes(error.status)) throw error;
+      label = await find();
+    }
+  }
+  if (typeof label?.id !== 'string' || !/^[a-f\d]{24}$/i.test(label.id) || label.name !== REVIEW_LABEL) {
+    throw new Error('Invalid review label response');
+  }
+  return label;
+}
+
+async function adminApiRequest(env, path, { method = 'GET', body } = {}) {
   const base = env.ADMIN_API_URL.replace(/\/+$/, '');
-  const url = `${base}/ghost/api/admin/members/${member.id}/`;
+  const url = `${base}/ghost/api/admin/${path}`;
   const headers = await adminApiHeaders(env.ADMIN_API_KEY);
   const res = await fetch(url, {
-    method: 'PUT',
+    method,
     headers,
-    body: JSON.stringify({ members: [body] }),
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Admin API ${res.status}: ${text.slice(0, 300)}`);
+    const error = new Error(`Admin API ${res.status}`);
+    error.status = res.status;
+    throw error;
   }
+  return res.json();
 }
 
 async function adminApiHeaders(adminApiKey) {

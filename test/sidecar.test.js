@@ -157,3 +157,47 @@ test('sidecar applies IP attempts before verifying case-variant signup requests'
   assert.equal((await sendMixedCase()).status, 429);
   assert.equal(calls.length, 0);
 });
+
+test('upstream X-Forwarded-For is always rebuilt from the resolved client IP', async (t) => {
+  const { guard, calls } = await setup(t);
+  assert.equal((await send(guard, { emailType: 'signin' }, { 'X-Forwarded-For': '203.0.113.99', 'CF-Connecting-IP': '203.0.113.88' })).status, 201);
+  assert.equal(calls[0].headers['x-forwarded-for'], calls[0].headers['cf-connecting-ip']);
+  assert.notEqual(calls[0].headers['x-forwarded-for'], '203.0.113.99');
+  const trusted = await setup(t, { TRUST_PROXY: 'true' });
+  assert.equal((await send(trusted.guard, {}, { 'X-Forwarded-For': '192.0.2.1' })).status, 201);
+  assert.equal(trusted.calls[0].headers['x-forwarded-for'], '192.0.2.1');
+});
+
+for (const emailType of ['signup', 'signin']) {
+  test(`chunked ${emailType} requests discard hop headers and retain their JSON body`, async (t) => {
+    const { guard, calls } = await setup(t);
+    const body = JSON.stringify({ email: 'reader@work.example', emailType });
+    const response = await new Promise((resolve, reject) => {
+      const request = http.request(`${guard}/members/api/send-magic-link/`, {
+        method: 'POST', headers: { 'content-type': 'application/json', connection: 'x-discard, keep-alive', 'x-discard': 'private-hop', 'x-retain': 'end-to-end' },
+      }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res));
+      });
+      request.on('error', reject);
+      request.write(body.slice(0, 15));
+      request.end(body.slice(15));
+    });
+    assert.equal(response.statusCode, 201);
+    assert.equal(calls[0].body, body);
+    assert.equal(calls[0].headers['x-discard'], undefined);
+    assert.equal(calls[0].headers['x-retain'], 'end-to-end');
+  });
+}
+
+test('response hop headers are not relayed to the client', async (t) => {
+  const origin = await listen(t, http.createServer((_req, res) => {
+    res.writeHead(200, { connection: 'x-discard, close', 'x-discard': 'upstream-hop', 'content-type': 'application/json' });
+    res.end('{}');
+  }));
+  const guard = await listen(t, createGuardServer({ GHOST_ORIGIN: origin }));
+  const response = await fetch(`${guard}/members/api/site/`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-discard'), null);
+  assert.equal(await response.text(), '{}');
+});
