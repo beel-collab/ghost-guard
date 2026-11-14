@@ -5,10 +5,13 @@
   "type": "module",
   "description": "Stop scanner-confirmed Ghost signup spam with a confirmation interstitial. Cloudflare Worker or Docker sidecar.",
   "license": "MIT",
+  "engines": { "node": ">=22.16.0" },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "sidecar": "node sidecar/server.mjs"
+    "sidecar": "node sidecar/server.mjs",
+    "test": "node --test",
+    "check": "node --check src/worker.js && node --check sidecar/server.mjs && node --check src/rate-limit.js && node --check src/webhook.js && node --check public/ghost-guard/turnstile.js"
   },
   "devDependencies": {
     "wrangler": "^4.45.0"

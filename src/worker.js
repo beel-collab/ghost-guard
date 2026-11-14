@@ -7,8 +7,13 @@
  * GET therefore no longer confirm the signup.
  *
  * Optional second mode: POST /signup-shield/webhooks/member-added
- * labels or unsubscribes new members via the Admin API (Ghost(Pro)-friendly).
+ * labels new members for review via the Admin API (Ghost(Pro)-friendly).
  */
+
+import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.js';
+export { SignupRateLimiter } from './rate-limit.js';
+import { handleMemberAddedWebhook } from './webhook.js';
+export { MemberLabeller } from './webhook.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
 const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
@@ -16,23 +21,144 @@ const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const path = canonicalPath(url.pathname);
+    // Outside a subfolder install the path belongs to whatever else serves this
+    // hostname, so it goes to the zone's normal origin, not to Ghost. The
+    // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
+    // requests use the same rule, so a lookalike path on a root app still
+    // reaches that app after the checks.
+    const forward = env.SIDECAR === true || insideGhost(path, env)
+      ? (forwarded) => forwardToOrigin(forwarded, env)
+      : (forwarded) => forwardToZone(forwarded);
+
+    if (url.pathname === '/ghost-guard/turnstile.js') {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+      }
+      return env.ASSETS.fetch(request);
+    }
+
+    // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
+    // serves these under <subfolder>/members, and covering a lookalike path
+    // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
+    if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
+      return handleSendMagicLink(request, env, forward);
+    }
 
     if (url.pathname === '/signup-shield/webhooks/member-added') {
       return handleMemberAddedWebhook(request, env);
     }
 
-    if (isMembersMagicLink(url)) {
-      return handleMagicLink(request, url, env);
+    if (path.endsWith('/members') && url.searchParams.has('token')) {
+      return handleMagicLink(request, url, env, forward);
     }
 
-    return forwardToOrigin(request, env);
+    return forward(request);
   },
 };
 
-function isMembersMagicLink(url) {
-  const path = url.pathname.replace(/\/+$/, '') || '/';
-  return (path === '/members' || path === '/members/') && url.searchParams.has('token');
+async function handleSendMagicLink(request, env, forward) {
+  let body;
+  try {
+    body = await request.clone().json();
+  } catch {
+    return portalError('Invalid signup request. Please try again.', 400);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return portalError('Invalid signup request. Please try again.', 400);
+  }
+
+  // Only the explicit signin type is exempt. Missing/unknown types must not
+  // become an alternative path to an unprotected signup.
+  if (body.emailType === 'signin') return forward(request);
+  if (typeof body.email !== 'string' || !body.email.trim()) {
+    return portalError('Please enter an email address.', 400);
+  }
+
+  // Bound verification traffic even when every challenge is missing or invalid.
+  const ipError = await rateLimitRejection(checkSignupIpRateLimit(request, env));
+  if (ipError) return ipError;
+
+  if (env.TURNSTILE_SECRET) {
+    const token = request.headers.get('cf-turnstile-response') || body['cf-turnstile-response'];
+    const valid = await verifyTurnstile(token, env, request);
+    if (!valid) return portalError('Unable to verify your request, please try again', 400);
+  }
+
+  // Invalid challenges consume IP attempts but never a reader's email quota.
+  const emailError = await rateLimitRejection(checkSignupEmailRateLimit(request, body.email, env));
+  if (emailError) return emailError;
+
+  // Strip our token before sending JSON to Ghost, retaining all Portal fields.
+  const headers = new Headers(request.headers);
+  headers.delete('cf-turnstile-response');
+  headers.delete('content-length');
+  delete body['cf-turnstile-response'];
+  return forward(new Request(request, { headers, body: JSON.stringify(body) }));
 }
+
+async function rateLimitRejection(check) {
+  try {
+    const limit = await check;
+    return limit.allowed ? null : portalError('Too many sign-up attempts, try again later', 429, { 'Retry-After': String(limit.retryAfter) });
+  } catch {
+    return portalError('Signup protection is temporarily unavailable. Please try again later.', 503);
+  }
+}
+
+function portalError(message, status, headers = {}) {
+  return new Response(JSON.stringify({ errors: [{ message, type: status === 429 ? 'TooManyRequestsError' : 'ValidationError' }] }), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
+  });
+}
+
+// GHOST_BASE_PATH: the subfolder Ghost is installed under (e.g. "/blog" for
+// example.com/blog), or empty for the domain root. Returned lowercased with a
+// leading slash and no trailing one, since Ghost's routes ignore case.
+// Only routing depends on this: protection is decided by path suffix. Values a
+// request path could never match (dot or empty segments, query characters)
+// are rejected rather than silently misrouting.
+export function ghostBasePath(env) {
+  const path = String(env.GHOST_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!path) return '';
+  const valid = path.split('/').every((segment) => /^(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+$/.test(segment) && segment !== '.' && segment !== '..');
+  if (!valid) throw new Error('GHOST_BASE_PATH must be a plain path such as /blog');
+  return `/${path.toLowerCase()}`;
+}
+
+let warnedBasePath = false;
+
+// With an invalid base path nothing is treated as Ghost's, so every page goes
+// to the zone's normal origin: a separate root site keeps working, and
+// signups stay protected because protection does not depend on the base.
+function insideGhost(path, env) {
+  let base;
+  try {
+    base = ghostBasePath(env);
+  } catch (error) {
+    if (!warnedBasePath) {
+      warnedBasePath = true;
+      console.error(`ghost-guard: ${error.message}; sending pages to the zone origin`);
+    }
+    return false;
+  }
+  return !base || path === base || path.startsWith(`${base}/`);
+}
+
+// The sidecar buffers and size-limits only the bodies ghost-guard reads.
+export function readsRequestBody(pathname) {
+  const path = canonicalPath(pathname);
+  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/');
+}
+
+// Lowercased, without trailing slashes, and with repeated slashes collapsed:
+// Express routes "/members//api/…" and "/blog//members/…" to Ghost's handlers,
+// so the guard must treat them as the paths Ghost will serve.
+function canonicalPath(pathname) {
+  return pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
 
 function interstitialActions(env) {
   const raw = env.INTERSTITIAL_ACTIONS || DEFAULT_ACTIONS;
@@ -49,14 +175,14 @@ function shouldInterstitial(url, env) {
   return interstitialActions(env).has(action);
 }
 
-async function handleMagicLink(request, url, env) {
+async function handleMagicLink(request, url, env, forward) {
   const secret = env.CONFIRM_SECRET;
   if (secret && request.headers.get(BYPASS_HEADER) === secret) {
-    return forwardToOrigin(request, env);
+    return forward(request);
   }
 
   if (!shouldInterstitial(url, env)) {
-    return forwardToOrigin(request, env);
+    return forward(request);
   }
 
   if (request.method === 'GET' || request.method === 'HEAD') {
@@ -73,25 +199,23 @@ async function handleMagicLink(request, url, env) {
   }
 
   if (request.method === 'POST') {
-    return confirmAndForward(request, url, env);
+    return confirmAndForward(request, url, env, forward);
   }
 
   return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD, POST' } });
 }
 
-async function confirmAndForward(request, url, env) {
+async function confirmAndForward(request, url, env, forward) {
   const contentType = request.headers.get('content-type') || '';
   let token = url.searchParams.get('token');
   let action = url.searchParams.get('action');
   let referrer = url.searchParams.get('r');
-  let turnstileToken = '';
 
   if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
     const form = await request.formData();
     token = String(form.get('token') || token || '');
     action = String(form.get('action') || action || '');
     referrer = String(form.get('r') || referrer || '');
-    turnstileToken = String(form.get('cf-turnstile-response') || '');
   }
 
   if (!token) {
@@ -99,16 +223,6 @@ async function confirmAndForward(request, url, env) {
       status: 400,
       headers: htmlHeaders(),
     });
-  }
-
-  if (env.TURNSTILE_SITE_KEY && env.TURNSTILE_SECRET) {
-    const ok = await verifyTurnstile(turnstileToken, env.TURNSTILE_SECRET, request.headers.get('CF-Connecting-IP'));
-    if (!ok) {
-      return new Response(renderInterstitial(url, env, 'The security check failed. Please try again.'), {
-        status: 403,
-        headers: htmlHeaders(),
-      });
-    }
   }
 
   const confirmUrl = new URL(url.href);
@@ -122,7 +236,7 @@ async function confirmAndForward(request, url, env) {
     headers: originForwardHeaders(request, env),
   });
 
-  return forwardToOrigin(originRequest, env);
+  return forward(originRequest);
 }
 
 function originForwardHeaders(request, env) {
@@ -135,16 +249,36 @@ function originForwardHeaders(request, env) {
   return headers;
 }
 
+// The hostname's normal Cloudflare origin, as if the Worker were not routed.
+// Same-zone subrequests do not re-enter this Worker, so the bypass header is
+// never needed here; dropping it keeps CONFIRM_SECRET away from other apps.
+function forwardToZone(request) {
+  const clientIp = request.headers.get('CF-Connecting-IP');
+  const headers = new Headers(request.headers);
+  headers.delete(BYPASS_HEADER);
+  if (clientIp) headers.set('X-Forwarded-For', clientIp);
+  return fetch(new Request(request, { headers }));
+}
+
 async function forwardToOrigin(request, env) {
+  // Ghost trusts every proxy and takes the leftmost X-Forwarded-For entry as the
+  // client, and Cloudflare only appends to what the client sent. Replace the
+  // header with the address Cloudflare (or the sidecar) resolved, so clients
+  // cannot dodge Ghost's per-IP throttling, which is all that limits sign-ins.
+  const clientIp = request.headers.get('CF-Connecting-IP');
   const origin = (env.GHOST_ORIGIN || '').replace(/\/+$/, '');
-  if (!origin) {
-    // Same-zone routing: the bypass header (set by confirmAndForward) prevents a loop.
-    return fetch(request);
-  }
+  // Without GHOST_ORIGIN, Ghost is the zone origin; same-zone subrequests do
+  // not re-enter this Worker.
+  if (!origin) return forwardToZone(request);
 
   const url = new URL(request.url);
-  const target = new URL(url.pathname + url.search, origin);
+  // Assign URL components so a leading // in the path cannot change authority.
+  const target = new URL(origin);
+  target.pathname = url.pathname;
+  target.search = url.search;
+  target.hash = '';
   const headers = new Headers(request.headers);
+  if (clientIp) headers.set('X-Forwarded-For', clientIp);
   headers.set('Host', new URL(origin).host);
   if (env.CONFIRM_SECRET) {
     headers.set(BYPASS_HEADER, env.CONFIRM_SECRET);
@@ -156,23 +290,28 @@ async function forwardToOrigin(request, env) {
       headers,
       body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
       redirect: 'manual',
+      duplex: 'half',
     }),
   );
 }
 
-async function verifyTurnstile(token, secret, ip) {
-  if (!token) return false;
+async function verifyTurnstile(token, env, request) {
+  if (typeof token !== 'string' || !token || token.length > 2048) return false;
   const body = new URLSearchParams();
-  body.set('secret', secret);
+  body.set('secret', env.TURNSTILE_SECRET);
   body.set('response', token);
+  const ip = request.headers.get('CF-Connecting-IP');
   if (ip) body.set('remoteip', ip);
   try {
     const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       body,
+      signal: AbortSignal.timeout(10_000),
     });
+    if (!res.ok) return false;
     const data = await res.json();
-    return data && data.success === true;
+    const hostname = env.TURNSTILE_HOSTNAME || new URL(request.url).hostname;
+    return data?.success === true && data.hostname === hostname && data.action === 'ghost_signup';
   } catch {
     return false;
   }
@@ -201,13 +340,8 @@ function renderInterstitial(url, env, error) {
   const token = escapeHtml(url.searchParams.get('token') || '');
   const action = escapeHtml(url.searchParams.get('action') || '');
   const referrer = escapeHtml(url.searchParams.get('r') || '');
-  const siteKey = env.TURNSTILE_SITE_KEY || '';
   const errorHtml = error
     ? `<p class="error" role="alert">${escapeHtml(error)}</p>`
-    : '';
-  const turnstileHtml = siteKey
-    ? `<div class="cf-turnstile" data-sitekey="${escapeHtml(siteKey)}" data-action="ghost_signup_confirm"></div>
-       <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>`
     : '';
   // No auto-submit. Corporate scanners often run JavaScript; a click is the signal we want.
   return `<!doctype html>
@@ -227,7 +361,6 @@ function renderInterstitial(url, env, error) {
     button { appearance: none; border: 0; border-radius: 8px; background: #15171a; color: #fff; font: inherit; font-weight: 600; padding: .8rem 1.2rem; cursor: pointer; width: 100%; }
     button:hover { background: #2b2f33; }
     .hint { font-size: .85rem; color: #738a94; margin-top: 1.25rem; }
-    .cf-turnstile { margin: 0 0 1rem; }
     @media (prefers-color-scheme: dark) {
       body { background: #111; color: #f4f4f2; }
       main { background: #1c1e21; box-shadow: none; }
@@ -246,178 +379,10 @@ function renderInterstitial(url, env, error) {
       <input type="hidden" name="token" value="${token}">
       <input type="hidden" name="action" value="${action}">
       <input type="hidden" name="r" value="${referrer}">
-      ${turnstileHtml}
       <button type="submit">Confirm signup</button>
     </form>
     <p class="hint">If you did not try to sign up, close this page. No account will be created.</p>
   </main>
 </body>
 </html>`;
-}
-
-async function handleMemberAddedWebhook(request, env) {
-  if (request.method !== 'POST') {
-    return new Response('Method Not Allowed', { status: 405 });
-  }
-  if (env.CLEANUP_ENABLED !== 'true') {
-    return json({ ok: false, error: 'cleanup disabled' }, 503);
-  }
-  if (!env.ADMIN_API_URL || !env.ADMIN_API_KEY) {
-    return json({ ok: false, error: 'admin api not configured' }, 503);
-  }
-
-  const raw = await request.text();
-  if (env.WEBHOOK_SECRET) {
-    const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
-    if (!valid) {
-      return json({ ok: false, error: 'invalid signature' }, 401);
-    }
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return json({ ok: false, error: 'invalid json' }, 400);
-  }
-
-  // Ghost webhook payload is { event, member: { current, previous } }
-  // see ghost/core/server/services/webhooks/serialize.js
-  const member =
-    payload.member?.current ||
-    payload.member ||
-    (Array.isArray(payload.members) ? payload.members[0] : null);
-  if (!member || !member.id || !member.email) {
-    return json({ ok: false, error: 'no member in payload' }, 400);
-  }
-
-  if (member.status && member.status !== 'free') {
-    return json({ ok: true, skipped: 'not-free' });
-  }
-
-  const domain = String(member.email).split('@')[1]?.toLowerCase() || '';
-  const skip = new Set(
-    (env.CLEANUP_SKIP_DOMAINS || '')
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-  if (skip.has(domain)) {
-    return json({ ok: true, skipped: 'consumer-domain' });
-  }
-
-  const mode = env.CLEANUP_MODE || 'label';
-  if (mode === 'label') {
-    await adminPatchMember(env, member, {
-      labels: [...existingLabelNames(member), env.CLEANUP_LABEL || 'signup-shield-review'].map((name) => ({ name })),
-    });
-    return json({ ok: true, action: 'label', id: member.id });
-  }
-
-  if (mode === 'unsubscribe') {
-    await adminPatchMember(env, member, { newsletters: [], subscribed: false });
-    return json({ ok: true, action: 'unsubscribe', id: member.id });
-  }
-
-  return json({ ok: false, error: `unknown CLEANUP_MODE ${mode}` }, 400);
-}
-
-function existingLabelNames(member) {
-  if (!Array.isArray(member.labels)) return [];
-  return member.labels.map((l) => l.name).filter(Boolean);
-}
-
-async function adminPatchMember(env, member, body) {
-  const base = env.ADMIN_API_URL.replace(/\/+$/, '');
-  const url = `${base}/ghost/api/admin/members/${member.id}/`;
-  const headers = await adminApiHeaders(env.ADMIN_API_KEY);
-  const res = await fetch(url, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify({ members: [body] }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Admin API ${res.status}: ${text.slice(0, 300)}`);
-  }
-}
-
-async function adminApiHeaders(adminApiKey) {
-  const [id, secret] = String(adminApiKey).split(':');
-  if (!id || !secret) {
-    throw new Error('ADMIN_API_KEY must be in id:secret form');
-  }
-  const enc = new TextEncoder();
-  const now = Math.floor(Date.now() / 1000);
-  const header = btoa(JSON.stringify({ alg: 'HS256', kid: id, typ: 'JWT' }))
-    .replace(/=+$/, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-  const payload = btoa(JSON.stringify({ iat: now, exp: now + 300, aud: '/admin/' }))
-    .replace(/=+$/, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-  const data = `${header}.${payload}`;
-  const key = await crypto.subtle.importKey(
-    'raw',
-    hexToBytes(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(data));
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)))
-    .replace(/=+$/, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-  return {
-    Authorization: `Ghost ${data}.${sig}`,
-    'Content-Type': 'application/json',
-    'Accept-Version': 'v6.0',
-  };
-}
-
-function hexToBytes(hex) {
-  const clean = hex.trim();
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
-}
-
-async function verifyGhostWebhook(rawBody, signatureHeader, secret) {
-  // Ghost signs with: sha256=hex, t=timestamp
-  // https://docs.ghost.org/webhooks
-  const parts = Object.fromEntries(
-    String(signatureHeader)
-      .split(',')
-      .map((p) => p.trim().split('='))
-      .filter((kv) => kv.length === 2),
-  );
-  const ts = parts.t;
-  const hash = parts.sha256;
-  if (!ts || !hash) return false;
-  // Ghost uses Date.now() milliseconds and HMAC(payload + ts). See webhook-trigger.js.
-  const tsNum = Number(ts);
-  if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > 5 * 60 * 1000) return false;
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [
-    'sign',
-  ]);
-  const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(`${rawBody}${ts}`));
-  const expected = [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  if (expected.length !== hash.length) return false;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) {
-    diff |= expected.charCodeAt(i) ^ hash.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
 }
