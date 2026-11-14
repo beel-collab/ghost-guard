@@ -1,5 +1,7 @@
 # ghost-guard
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/beel-collab/ghost-guard)
+
 Protect a self-hosted Ghost publication against two stages of signup abuse:
 
 1. **Before an email is sent:** intercept signup requests to `/members/api/send-magic-link/`, verify an optional Turnstile challenge server-side, and enforce IP and email quotas.
@@ -17,7 +19,11 @@ Ghost has no official plugin system. This is a proxy prototype, not an official 
 
 ## Self-hosted: Cloudflare Worker
 
-Your Ghost hostname must already be proxied by Cloudflare. From this checkout:
+Your Ghost hostname must already be proxied by Cloudflare.
+
+**One-click:** the **Deploy to Cloudflare** button above copies this repository to your GitHub account and deploys the Worker with its Durable Objects and assets from `wrangler.toml`. Afterwards, set the secrets (`CONFIRM_SECRET`, `GHOST_ORIGIN`, and `TURNSTILE_SECRET` if used) in **Workers & Pages → ghost-guard → Settings → Variables and Secrets**, then attach the route described below.
+
+**From a checkout:**
 
 ```bash
 npm ci
