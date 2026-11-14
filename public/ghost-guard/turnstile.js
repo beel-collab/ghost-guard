@@ -81,10 +81,12 @@
     // Never inspect or change requests to other endpoints or other sites.
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, window.location.href);
     const method = (init?.method || input?.method || 'GET').toUpperCase();
-    if (url.origin !== window.location.origin || url.pathname.replace(/\/+$/, '') !== '/members/api/send-magic-link' || method !== 'POST') {
+    if (url.origin !== window.location.origin || url.pathname.replace(/\/+$/, '').toLowerCase() !== '/members/api/send-magic-link' || method !== 'POST') {
       return originalFetch(input, init);
     }
-    const request = new Request(typeof input === 'string' || input instanceof URL ? url.href : input, init);
+    // Inspect a clone: constructing from a Request transfers its body, which
+    // would otherwise leave the original unusable on a passthrough branch.
+    const request = new Request(typeof input === 'string' || input instanceof URL ? url.href : input.clone(), init);
     let body;
     try {
       body = await request.clone().json();

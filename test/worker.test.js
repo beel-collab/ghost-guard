@@ -180,3 +180,74 @@ test('webhook refuses missing signing configuration and invalid signatures', asy
   assert.equal((await worker.fetch(request(), { ...env, WEBHOOK_SECRET: 'secret' })).status, 401);
   assert.equal(calls.origin.length, 0);
 });
+
+for (const path of ['/members/api/Send-Magic-Link/', '/MEMBERS/API/SEND-MAGIC-LINK', '/Members/api/send-magic-link/']) {
+  test(`case-variant signup route is protected: ${path}`, async (t) => {
+    const calls = mockFetch(t);
+    const env = envFor({ TURNSTILE_SECRET: 'secret', SIGNUP_IP_LIMIT: '1' });
+    const url = `https://blog.example${path}`;
+    assert.equal((await worker.fetch(signup({}, {}, url), env)).status, 400);
+    assert.equal((await worker.fetch(signup({}, {}, url), env)).status, 429);
+    assert.equal(calls.verification.length, 0);
+    assert.equal(calls.origin.length, 0);
+  });
+}
+
+test('case-variant confirmation paths still require a click', async (t) => {
+  const calls = mockFetch(t);
+  for (const path of ['/Members/', '/MEMBERS']) {
+    const response = await worker.fetch(new Request(`https://blog.example${path}?token=abc&action=signup`), envFor());
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /<form method="post"/);
+  }
+  assert.equal(calls.origin.length, 0);
+});
+
+test('origin forwarding cannot replace authority through a network-path reference', async (t) => {
+  const calls = mockFetch(t);
+  const env = envFor({ GHOST_ORIGIN: 'https://origin.example:8443', CONFIRM_SECRET: 'private-secret' });
+  for (const path of ['//collector.invalid/capture?token=abc', '///collector.invalid/capture', '/members/api/site/?x=1']) {
+    const response = await worker.fetch(new Request(`https://blog.example${path}`, { headers: { cookie: 'session=private' } }), env);
+    assert.equal(response.status, 201);
+    const forwarded = calls.origin.at(-1);
+    const target = new URL(forwarded.url);
+    assert.equal(target.origin, 'https://origin.example:8443');
+    assert.equal(target.pathname + target.search, path);
+    assert.equal(forwarded.headers.get('host'), 'origin.example:8443');
+  }
+});
+
+test('IP attempts throttle invalid-token floods before additional Siteverify calls', async (t) => {
+  const calls = mockFetch(t, { success: false });
+  const env = envFor({ TURNSTILE_SECRET: 'secret', SIGNUP_IP_LIMIT: '1' });
+  assert.equal((await worker.fetch(signup({}, { 'cf-turnstile-response': 'bad' }), env)).status, 400);
+  for (let i = 0; i < 9; i++) {
+    const response = await worker.fetch(signup({}, { 'cf-turnstile-response': 'bad' }), env);
+    assert.equal(response.status, 429);
+    assert.ok(Number(response.headers.get('retry-after')) > 3590);
+  }
+  assert.equal(calls.verification.length, 1);
+  assert.equal(calls.origin.length, 0);
+  assert.equal(env.LOCAL_RATE_LIMITER.counters.size, 1);
+  assert.ok([...env.LOCAL_RATE_LIMITER.counters.keys()].every((key) => key.startsWith('ip:')));
+});
+
+test('missing-token floods consume only the sender IP quota, leaving the reader email quota available', async (t) => {
+  const calls = mockFetch(t);
+  const env = envFor({ TURNSTILE_SECRET: 'secret', SIGNUP_IP_LIMIT: '1', SIGNUP_EMAIL_LIMIT: '1' });
+  assert.equal((await worker.fetch(signup(), env)).status, 400);
+  assert.equal((await worker.fetch(signup(), env)).status, 429);
+  assert.equal((await worker.fetch(signup({}, { 'CF-Connecting-IP': '192.0.2.2', 'cf-turnstile-response': 'valid' }), env)).status, 201);
+  assert.equal(calls.verification.length, 1);
+  assert.equal(calls.origin.length, 1);
+});
+
+test('email-quota rejections still count as IP attempts', async (t) => {
+  const calls = mockFetch(t);
+  const env = envFor({ SIGNUP_IP_LIMIT: '3', SIGNUP_EMAIL_LIMIT: '1' });
+  assert.equal((await worker.fetch(signup(), env)).status, 201);
+  assert.equal((await worker.fetch(signup(), env)).status, 429);
+  assert.equal((await worker.fetch(signup({ email: 'other@work.example' }), env)).status, 201);
+  assert.equal((await worker.fetch(signup({ email: 'third@work.example' }), env)).status, 429);
+  assert.equal(calls.origin.length, 2);
+});

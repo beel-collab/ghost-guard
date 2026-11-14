@@ -44,6 +44,11 @@ export function createGuardServer(env = process.env) {
         : req.socket.remoteAddress;
       headers.set('CF-Connecting-IP', ip || 'unknown');
       headers.delete('X-Ghost-Signup-Shield');
+      const socketProtocol = req.socket.encrypted ? 'https' : 'http';
+      const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').trim().toLowerCase();
+      headers.set('X-Forwarded-Proto', env.TRUST_PROXY === 'true' && ['http', 'https'].includes(forwardedProtocol)
+        ? forwardedProtocol : socketProtocol);
+      headers.set('Accept-Encoding', 'identity');
       const method = req.method || 'GET';
       const request = new Request(`http://${req.headers.host || 'localhost'}${req.url}`, {
         method,
@@ -51,11 +56,22 @@ export function createGuardServer(env = process.env) {
         body: method === 'GET' || method === 'HEAD' || !body.length ? undefined : body,
       });
       const response = await worker.fetch(request, workerEnv);
+      const responseBody = method === 'HEAD' || response.body === null ? null : Buffer.from(await response.arrayBuffer());
       const outgoing = Object.fromEntries(response.headers);
+      // Native fetch decodes these encodings but keeps their upstream headers.
+      // Normalize even if an origin ignores our Accept-Encoding: identity.
+      if (responseBody !== null) {
+        const encodings = (response.headers.get('content-encoding') || '').split(',').map((value) => value.trim().toLowerCase());
+        if (encodings.every((value) => ['gzip', 'x-gzip', 'deflate', 'br'].includes(value))) {
+          delete outgoing['content-encoding'];
+        }
+        outgoing['content-length'] = String(responseBody.length);
+      }
+      delete outgoing['transfer-encoding'];
       const cookies = response.headers.getSetCookie();
       if (cookies.length) outgoing['set-cookie'] = cookies;
       res.writeHead(response.status, outgoing);
-      res.end(method === 'HEAD' ? undefined : Buffer.from(await response.arrayBuffer()));
+      res.end(responseBody ?? undefined);
     } catch (error) {
       // Avoid logging request URLs/bodies, which may contain magic-link tokens.
       console.error('ghost-guard proxy error:', error.message);

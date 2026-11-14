@@ -10,7 +10,7 @@
  * labels new members for review via the Admin API (Ghost(Pro)-friendly).
  */
 
-import { checkSignupRateLimit } from './rate-limit.js';
+import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.js';
 export { SignupRateLimiter } from './rate-limit.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
@@ -27,7 +27,7 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    if (url.pathname.replace(/\/+$/, '') === '/members/api/send-magic-link' && request.method === 'POST') {
+    if (url.pathname.replace(/\/+$/, '').toLowerCase() === '/members/api/send-magic-link' && request.method === 'POST') {
       return handleSendMagicLink(request, env);
     }
 
@@ -61,22 +61,19 @@ async function handleSendMagicLink(request, env) {
     return portalError('Please enter an email address.', 400);
   }
 
+  // Bound verification traffic even when every challenge is missing or invalid.
+  const ipError = await rateLimitRejection(checkSignupIpRateLimit(request, env));
+  if (ipError) return ipError;
+
   if (env.TURNSTILE_SECRET) {
     const token = request.headers.get('cf-turnstile-response') || body['cf-turnstile-response'];
     const valid = await verifyTurnstile(token, env, request);
     if (!valid) return portalError('Unable to verify your request, please try again', 400);
   }
 
-  // Invalid challenges do not exhaust somebody else's daily email quota.
-  let limit;
-  try {
-    limit = await checkSignupRateLimit(request, body.email, env);
-  } catch {
-    return portalError('Signup protection is temporarily unavailable. Please try again later.', 503);
-  }
-  if (!limit.allowed) {
-    return portalError('Too many sign-up attempts, try again later', 429, { 'Retry-After': String(limit.retryAfter) });
-  }
+  // Invalid challenges consume IP attempts but never a reader's email quota.
+  const emailError = await rateLimitRejection(checkSignupEmailRateLimit(request, body.email, env));
+  if (emailError) return emailError;
 
   // Strip our token before sending JSON to Ghost, retaining all Portal fields.
   const headers = new Headers(request.headers);
@@ -84,6 +81,15 @@ async function handleSendMagicLink(request, env) {
   headers.delete('content-length');
   delete body['cf-turnstile-response'];
   return forwardToOrigin(new Request(request, { headers, body: JSON.stringify(body) }), env);
+}
+
+async function rateLimitRejection(check) {
+  try {
+    const limit = await check;
+    return limit.allowed ? null : portalError('Too many sign-up attempts, try again later', 429, { 'Retry-After': String(limit.retryAfter) });
+  } catch {
+    return portalError('Signup protection is temporarily unavailable. Please try again later.', 503);
+  }
 }
 
 function portalError(message, status, headers = {}) {
@@ -94,8 +100,8 @@ function portalError(message, status, headers = {}) {
 }
 
 function isMembersMagicLink(url) {
-  const path = url.pathname.replace(/\/+$/, '') || '/';
-  return (path === '/members' || path === '/members/') && url.searchParams.has('token');
+  const path = url.pathname.replace(/\/+$/, '').toLowerCase() || '/';
+  return path === '/members' && url.searchParams.has('token');
 }
 
 function interstitialActions(env) {
@@ -195,7 +201,11 @@ async function forwardToOrigin(request, env) {
   }
 
   const url = new URL(request.url);
-  const target = new URL(url.pathname + url.search, origin);
+  // Assign URL components so a leading // in the path cannot change authority.
+  const target = new URL(origin);
+  target.pathname = url.pathname;
+  target.search = url.search;
+  target.hash = '';
   const headers = new Headers(request.headers);
   headers.set('Host', new URL(origin).host);
   if (env.CONFIRM_SECRET) {

@@ -15,8 +15,8 @@ export function rateLimitConfig(env) {
   };
 }
 
-// Both counters are checked before either is incremented. Windows start with the
-// first allowed attempt; rejected requests never extend the window.
+// Reserve each supplied bucket atomically. Windows start with the first allowed
+// attempt; rejected requests never extend the window.
 function consume(store, buckets, now) {
   const counters = buckets.map(({ key, limit, windowMs }) => {
     const previous = store.get(key);
@@ -56,7 +56,8 @@ export class MemoryRateLimiter {
 }
 
 // One SQLite-backed Durable Object per publication. A synchronous transaction
-// checks and reserves both quotas atomically across concurrent Worker instances.
+// reserves quotas atomically across concurrent Worker instances. IP attempts
+// are reserved before Turnstile; email attempts only after verification.
 export class SignupRateLimiter {
   constructor(ctx) {
     this.storage = ctx.storage;
@@ -91,15 +92,24 @@ async function digest(value) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export async function checkSignupRateLimit(request, email, env) {
+export async function checkSignupIpRateLimit(request, env) {
   const config = rateLimitConfig(env);
   // The sidecar overwrites this header using the socket (or an explicitly
   // trusted upstream); Workers receive it from Cloudflare, never X-Forwarded-For.
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const buckets = [
+  return consumeBuckets(request, env, [
     { key: `ip:${await digest(ip)}`, limit: config.ipLimit, windowMs: config.ipWindowMs },
+  ]);
+}
+
+export async function checkSignupEmailRateLimit(request, email, env) {
+  const config = rateLimitConfig(env);
+  return consumeBuckets(request, env, [
     { key: `email:${await digest(email.trim().toLowerCase())}`, limit: config.emailLimit, windowMs: config.emailWindowMs },
-  ];
+  ]);
+}
+
+async function consumeBuckets(request, env, buckets) {
   if (env.LOCAL_RATE_LIMITER) return env.LOCAL_RATE_LIMITER.consume(buckets);
   if (!env.SIGNUP_RATE_LIMITER) throw new Error('SIGNUP_RATE_LIMITER binding is required');
   const id = env.SIGNUP_RATE_LIMITER.idFromName(new URL(request.url).origin);

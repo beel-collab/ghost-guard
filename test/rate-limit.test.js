@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { MemoryRateLimiter, SignupRateLimiter, checkSignupRateLimit, rateLimitConfig } from '../src/rate-limit.js';
+import { MemoryRateLimiter, SignupRateLimiter, checkSignupIpRateLimit, checkSignupEmailRateLimit, rateLimitConfig } from '../src/rate-limit.js';
 
 // Run the DO's real SQL against SQLite; the Worker integration smoke test uses
 // Wrangler's actual Durable Object runtime as well.
@@ -45,7 +45,7 @@ for (const adapter of ['memory', 'durable']) {
     assert.ok(results.find((r) => !r.allowed).retryAfter > 3590);
   });
 
-  test(`${adapter}: rejected email quota does not burn a different IP quota; windows expire`, async (t) => {
+  test(`${adapter}: a rejected bucket batch is not partially reserved; windows expire independently`, async (t) => {
     let now = 1_000_000;
     t.mock.method(Date, 'now', () => now);
     const storage = adapter === 'durable' ? sqliteStorage() : null;
@@ -79,17 +79,19 @@ test('Durable Object counters survive object reconstruction and expired rows are
 });
 
 test('Worker uses the durable namespace and stores digests instead of email/IP', async () => {
-  const seen = {};
+  const seen = { bodies: [] };
   const env = { SIGNUP_RATE_LIMITER: {
     idFromName: (name) => { seen.name = name; return 'object-id'; },
-    get: (id) => ({ async fetch(url, init) { seen.id = id; seen.body = init.body; return Response.json({ allowed: true }); } }),
+    get: (id) => ({ async fetch(url, init) { seen.id = id; seen.bodies.push(init.body); return Response.json({ allowed: true }); } }),
   } };
-  const response = await checkSignupRateLimit(new Request('https://blog.example/members/api/send-magic-link/', { headers: { 'CF-Connecting-IP': '192.0.2.1' } }), 'Reader@Work.Example', env);
-  assert.equal(response.allowed, true);
+  const request = new Request('https://blog.example/members/api/send-magic-link/', { headers: { 'CF-Connecting-IP': '192.0.2.1' } });
+  assert.equal((await checkSignupIpRateLimit(request, env)).allowed, true);
+  assert.equal((await checkSignupEmailRateLimit(request, 'Reader@Work.Example', env)).allowed, true);
   assert.equal(seen.name, 'https://blog.example');
   assert.equal(seen.id, 'object-id');
-  assert.doesNotMatch(seen.body, /192\.0\.2\.1|reader|work\.example/i);
-  assert.match(JSON.parse(seen.body).buckets[0].key, /^ip:[a-f0-9]{64}$/);
+  for (const body of seen.bodies) assert.doesNotMatch(body, /192\.0\.2\.1|reader|work\.example/i);
+  assert.match(JSON.parse(seen.bodies[0]).buckets[0].key, /^ip:[a-f0-9]{64}$/);
+  assert.match(JSON.parse(seen.bodies[1]).buckets[0].key, /^email:[a-f0-9]{64}$/);
 });
 
 test('invalid configuration falls back to safe defaults', () => {

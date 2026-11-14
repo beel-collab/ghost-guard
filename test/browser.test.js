@@ -6,12 +6,20 @@ import vm from 'node:vm';
 const script = await readFile(new URL('../public/ghost-guard/turnstile.js', import.meta.url), 'utf8');
 function browser({ failure = false, unavailable = false } = {}) {
   const calls = [];
+  const requests = [];
   const widgets = new Map();
   let sequence = 0;
   const elements = [];
   const window = {
     location: { href: 'https://blog.example/article/', origin: 'https://blog.example' },
-    fetch: async (...args) => { calls.push(args); return new Response('{}', { status: 201 }); },
+    fetch: async (...args) => {
+      // Exercise native body-transfer semantics instead of only recording args.
+      const input = typeof args[0] === 'string' || args[0] instanceof URL ? new URL(args[0], window.location.href).href : args[0];
+      const request = new Request(input, args[1]);
+      calls.push(args);
+      requests.push({ url: request.url, headers: request.headers, body: await request.text() });
+      return new Response('{}', { status: 201 });
+    },
     turnstile: unavailable ? undefined : {
       render: (container, options) => { const id = ++sequence; widgets.set(id, options); return id; },
       execute: (id) => queueMicrotask(() => failure ? widgets.get(id)['error-callback']() : widgets.get(id).callback(`token-${id}`)),
@@ -26,7 +34,7 @@ function browser({ failure = false, unavailable = false } = {}) {
   };
   const context = vm.createContext({ window, document, URL, Request, Response, Headers, Promise, setTimeout, clearTimeout, queueMicrotask });
   vm.runInContext(script, context);
-  return { window, document, context, calls, widgets, elements };
+  return { window, document, context, calls, requests, widgets, elements };
 }
 const options = (emailType = 'signup') => ({ method: 'POST', headers: { 'content-type': 'application/json', 'x-original': 'kept' }, body: JSON.stringify({ email: 'reader@work.example', emailType }), credentials: 'include' });
 
@@ -41,7 +49,7 @@ test('Portal URL gets a fresh, single-use token per request; preserves the origi
   assert.equal(second.headers.get('cf-turnstile-response'), 'token-2');
   assert.equal(first.headers.get('x-original'), 'kept');
   assert.equal(first.credentials, 'include');
-  assert.equal(await first.text(), init.body);
+  assert.equal(b.requests[0].body, init.body);
   assert.equal(init.headers['cf-turnstile-response'], undefined);
   assert.equal(b.widgets.size, 0);
   assert.ok(b.elements.every((element) => element.removed));
@@ -89,4 +97,26 @@ test('aborted signup is not sent and duplicate injection does not wrap fetch twi
   controller.abort();
   await assert.rejects(b.window.fetch('/members/api/send-magic-link/', { ...options(), signal: controller.signal }), { name: 'AbortError' });
   assert.equal(b.calls.length, 0);
+});
+
+for (const raw of [JSON.stringify({ email: 'reader@work.example', emailType: 'signin' }), '{']) {
+  test(`Request-object passthrough preserves the body: ${raw}`, async () => {
+    const b = browser();
+    const request = new Request('https://blog.example/members/api/send-magic-link/', {
+      method: 'POST', body: raw, headers: { 'content-type': 'application/json', 'x-original': 'kept' },
+    });
+    const response = await b.window.fetch(request);
+    assert.equal(response.status, 201);
+    assert.equal(b.calls[0][0], request);
+    assert.equal(b.requests[0].body, raw);
+    assert.equal(b.requests[0].headers.get('x-original'), 'kept');
+    assert.equal(b.elements.length, 0);
+  });
+}
+
+test('case-variant signup URLs receive a fresh Turnstile token too', async () => {
+  const b = browser();
+  await b.window.fetch('/Members/API/Send-Magic-Link/', options());
+  assert.equal(b.requests[0].headers.get('cf-turnstile-response'), 'token-1');
+  assert.equal(b.requests[0].url, 'https://blog.example/Members/API/Send-Magic-Link/');
 });

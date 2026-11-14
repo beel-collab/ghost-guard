@@ -33,7 +33,8 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
   const script = await dev.fetch('/ghost-guard/turnstile.js');
   assert.equal(script.status, 200);
   assert.match(await script.text(), /window.fetch =/);
-  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => dev.fetch('/members/api/send-magic-link/', {
+  const paths = ['/members/api/send-magic-link/', '/members/api/Send-Magic-Link/', '/MEMBERS/API/SEND-MAGIC-LINK'];
+  const responses = await Promise.all(Array.from({ length: 20 }, (_, i) => dev.fetch(paths[i % paths.length], {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: `reader${i}@work.example`, emailType: 'signup' }),
   })));
   assert.equal(responses.filter((r) => r.status === 201).length, 5);

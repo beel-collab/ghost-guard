@@ -5,7 +5,7 @@ Protect a self-hosted Ghost publication against two stages of signup abuse:
 1. **Before an email is sent:** intercept signup requests to `/members/api/send-magic-link/`, verify an optional Turnstile challenge server-side, and enforce IP and email quotas.
 2. **Before a member is created:** show a **Confirm signup** button when a signup magic link is opened. A scanner's GET/HEAD never reaches Ghost; only the form POST forwards the confirmation GET to Ghost.
 
-The confirmation page has no JavaScript, auto-submit, or Turnstile widget. Explicit sign-in requests (`emailType: "signin"`) and sign-in magic links pass through unchanged. Both trailing-slash variants of the signup API are protected. Ghost defaults a missing `emailType` to `subscribe`, so omitted and unknown types receive signup protection too.
+The confirmation page has no JavaScript, auto-submit, or Turnstile widget. Explicit sign-in requests (`emailType: "signin"`) and sign-in magic links pass through unchanged. Both trailing-slash and case variants of the signup API are protected, matching Ghost's routing. Ghost defaults a missing `emailType` to `subscribe`, so omitted and unknown types receive signup protection too.
 
 Ghost has no official plugin system. This is a proxy prototype, not an official Ghost plugin. It has automated tests but has not been deployed against a production Ghost site.
 
@@ -34,11 +34,10 @@ Use a long random `CONFIRM_SECRET`. Set `GHOST_ORIGIN` to a direct, DNS-only Gho
 In Cloudflare **Workers & Pages → ghost-guard → Settings/Triggers → Routes**, attach:
 
 ```text
-example.com/members*
-example.com/ghost-guard/*
+example.com/*
 ```
 
-The first route covers **both** the signup API and email confirmation links. The second serves the Code Injection script. Add `example.com/signup-shield/*` only if using the optional webhook. Leave the rest of the site unrouted.
+Route the **whole hostname** through the Worker. Ghost accepts case variants such as `/Members/API/Send-Magic-Link/`; a case-sensitive `/members*` Cloudflare route leaves those requests unprotected. The Worker protects the signup API and confirmation links, serves the Code Injection script and optional webhook, and forwards all other traffic to Ghost. Replace any older narrow routes for this Worker when updating an installation.
 
 ### Enable Turnstile on signup requests
 
@@ -52,7 +51,7 @@ The first route covers **both** the signup API and email confirmation links. The
 
 Save, then reload the public site before testing. Use Site Header, not an individual post's injection. Do not add `async` to this snippet. The Worker and sidecar both serve this URL. The public key is only in the snippet; `TURNSTILE_SITE_KEY` is no longer a server setting.
 
-The script wraps `window.fetch` only for POSTs to this same site's `/members/api/send-magic-link/`. Portal's API calls execute in the main page even though its UI uses frames. Explicit sign-in and unrelated requests keep their original arguments. Every signup gets a fresh token from a managed widget; it stays unobtrusive unless Cloudflare requires interaction, and is removed after completion. Script/challenge failures return a Portal-readable JSON error without sending the signup request. Custom fetch-based forms on the same site work too; forms using XHR or normal HTML submission need their own token integration. Cross-origin Portal embeds are outside this snippet's scope.
+The script wraps `window.fetch` only for POSTs to this same site's `/members/api/send-magic-link/`, including case variants. Portal's API calls execute in the main page even though its UI uses frames. Explicit sign-in and unrelated requests keep their original arguments, including Request-object inputs. Every signup gets a fresh token from a managed widget; it stays unobtrusive unless Cloudflare requires interaction, and is removed after completion. Script/challenge failures return a Portal-readable JSON error without sending the signup request. Custom fetch-based forms on the same site work too; forms using XHR or normal HTML submission need their own token integration. Cross-origin Portal embeds are outside this snippet's scope.
 
 For a custom client, send the token either as the `cf-turnstile-response` header or as a JSON field of that name. The server calls `https://challenges.cloudflare.com/turnstile/v0/siteverify` and checks success, hostname, and action `ghost_signup`. The expected hostname defaults to the incoming request hostname; use `TURNSTILE_HOSTNAME` if your public signup hostname differs. Tokens are removed before forwarding to Ghost. Missing, rejected, expired, reused, or unverifiable tokens yield HTTP 400:
 
@@ -66,11 +65,13 @@ For a custom client, send the token either as the `cf-turnstile-response` header
 
 Defaults are **5 signup requests per IP per hour** and **3 per email address per 24 hours**. These are independent windows anchored to the first allowed attempt. Email keys trim whitespace and ignore case; provider-specific aliases are not merged. Sign-in requests and confirmation clicks do not count.
 
-When Turnstile is enabled, only requests passing verification consume quotas. This prevents invalid challenges from exhausting another reader's email quota. When disabled, every well-formed signup request counts. An allowed attempt consumes quota even if Ghost subsequently fails; blocked attempts do not consume either quota or extend the windows.
+The **IP quota runs before Turnstile**. Every well-formed signup attempt consumes it, including missing/invalid challenges and requests later rejected by the email quota. This bounds verification traffic from one IP. An attempt rejected by the IP quota makes no Siteverify call and does not extend that quota's window.
 
-Exceeding either quota returns HTTP **429** with Ghost-compatible `errors[].message` JSON and a **Retry-After** header in seconds. The retry time covers every currently exceeded quota.
+The **email quota runs after Turnstile**. Failed challenges never consume it, so they cannot exhaust another reader's daily allowance. With Turnstile disabled, every attempt allowed by the IP quota reaches the email check. An attempt forwarded to Ghost consumes both quotas even if Ghost subsequently fails.
 
-The Worker uses **one SQLite-backed Durable Object per publication origin**, with both counters reserved in a single synchronous transaction. This keeps limits consistent across Worker instances and concurrent requests. KV's eventual consistency would allow quota overruns, which is why it is not used. Counter keys contain SHA-256 digests rather than plaintext IP/email values. An hourly alarm removes expired rows; expiry is also checked on each access. Missing/unavailable storage fails closed with 503. A single object is deliberately simple for publication signup traffic; very high traffic may need a different sharding design.
+Exceeding either quota returns HTTP **429** with Ghost-compatible `errors[].message` JSON and a **Retry-After** header in seconds for the quota that rejected the request.
+
+The Worker uses **one SQLite-backed Durable Object per publication origin**, with each quota reservation in a synchronous transaction. IP and email checks run at their respective stages; concurrent requests cannot overrun either counter. KV's eventual consistency would allow quota overruns, which is why it is not used. Counter keys contain SHA-256 digests rather than plaintext IP/email values. An hourly alarm removes expired rows; expiry is also checked on each access. Missing/unavailable storage fails closed with 503. A single object is deliberately simple for publication signup traffic; very high traffic may need a different sharding design. Existing counter data and the `v1` migration remain compatible.
 
 The sidecar uses the same quota algorithm with an **in-memory, per-process store**. Restarts reset quotas and multiple processes/replicas do not share them. Expired entries are swept during activity. Use one process or the Worker deployment if you need a shared durable limit.
 
@@ -91,26 +92,24 @@ docker compose -f sidecar/docker-compose.yml up --build
 
 Attach the container to Ghost's Docker network and adjust `GHOST_ORIGIN` in the compose file. The proxy listens on port 8787; Docker publishes it on loopback. It reuses the Worker's signup, confirmation, and webhook handlers. The Docker image includes the injection script. Incoming sidecar bodies are limited to 1 MiB.
 
-Forward `/members`, `/ghost-guard/`, and, if wanted, `/signup-shield/` to the sidecar. Keep other traffic going to Ghost. For example, in nginx:
+Forward member paths **case-insensitively**, `/ghost-guard/`, and, if wanted, `/signup-shield/` to the sidecar. Keep other traffic going to Ghost. For example, in nginx:
 
 ```nginx
-location = /members {
+location ~* ^/members(?:/|$) {
     proxy_pass http://127.0.0.1:8787;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $remote_addr;
-}
-location /members/ {
-    proxy_pass http://127.0.0.1:8787;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 location /ghost-guard/ {
     proxy_pass http://127.0.0.1:8787;
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 
-The sidecar uses the TCP peer's IP by default and ignores client-supplied `CF-Connecting-IP` and `X-Forwarded-For`. Behind nginx/Caddy, set **`TRUST_PROXY=true`** and ensure the immediate proxy **overwrites** `X-Forwarded-For` with the real client IP, as above. Do not append an untrusted incoming header, and prevent direct public access to the sidecar. Otherwise, all visitors may share the proxy's IP quota or clients may spoof addresses. Without a trusted proxy, leave this setting false. In Workers, Cloudflare supplies `CF-Connecting-IP`.
+The sidecar uses the TCP peer's IP and protocol by default and ignores client-supplied `CF-Connecting-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto`. Behind nginx/Caddy, set **`TRUST_PROXY=true`** and ensure the immediate proxy **overwrites** `X-Forwarded-For` with the real client IP and `X-Forwarded-Proto` with the public request scheme, as above. The scheme must be preserved on signup and confirmation requests so Ghost does not redirect to an internal HTTPS address. Do not append untrusted incoming headers, and prevent direct public access to the sidecar. Ensure no other nginx location takes precedence and sends case variants directly to Ghost. Without a trusted proxy, leave this setting false. In Workers, Cloudflare supplies `CF-Connecting-IP`.
 
 Use the same Code Injection snippet above for sidecar Turnstile. Its secret and quota variables are supplied through environment variables; `CONFIRM_SECRET` is unnecessary when the sidecar forwards directly to Ghost.
 
@@ -165,7 +164,7 @@ Use the same `WEBHOOK_SECRET` in Ghost. Its signature is required and checked wi
 | `SIGNUP_RATE_LIMITER` | Wrangler binding | SQLite Durable Object namespace, Worker only |
 | `ASSETS` | Wrangler binding | Serves the injection script, Worker only |
 | `PORT` | `8787` | Sidecar listening port |
-| `TRUST_PROXY` | `false` | Sidecar only: trust an overwritten X-Forwarded-For from your proxy |
+| `TRUST_PROXY` | `false` | Sidecar only: trust overwritten X-Forwarded-For and X-Forwarded-Proto from your proxy |
 | `CLEANUP_ENABLED` | `false` | Enables label-only webhook when exactly `true` |
 | `ADMIN_API_URL` | unset | Ghost Admin origin for the webhook |
 | `ADMIN_API_KEY` | unset | Secret `id:secret` Custom Integration key |
@@ -197,4 +196,4 @@ Before production, use a test Ghost publication and addresses you control:
 
 These layers reduce automated submissions and scanner confirmations; neither a button nor a challenge guarantees a human subscriber. The confirmation page alone does not stop emails being sent. This repository also contains an [upstream Ghost confirmation-page proposal](patch/confirmation-interstitial.md), not a ready-to-apply Ghost core patch.
 
-To roll back, remove the proxy routes and the Code Injection snippet. On Cloudflare, remove both `/members*` and `/ghost-guard/*` routes together; Ghost then receives requests directly again.
+To roll back, remove the proxy routes and the Code Injection snippet. On Cloudflare, remove the hostname-wide `example.com/*` route; Ghost then receives requests directly again. Remove any legacy narrow routes too.

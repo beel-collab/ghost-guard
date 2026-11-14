@@ -2,10 +2,10 @@ name = "ghost-guard"
 main = "src/worker.js"
 compatibility_date = "2026-11-01"
 
-# Attach all three routes on your proxied, self-hosted Ghost hostname:
-# example.com/members*       (signup API + confirmation links)
-# example.com/ghost-guard/*   (Code Injection script)
-# example.com/signup-shield/* (optional webhook labeller)
+# Attach example.com/* on your proxied, self-hosted Ghost hostname.
+# Ghost's routes ignore case: a /members* route alone misses /Members aliases.
+# The Worker protects members routes, serves the script/webhook, and forwards
+# all other traffic to Ghost.
 
 [assets]
 directory = "./public"
