@@ -1,0 +1,16 @@
+{
+  "name": "ghost-guard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Stop scanner-confirmed Ghost signup spam with a confirmation interstitial. Cloudflare Worker or Docker sidecar.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "sidecar": "node sidecar/server.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}

@@ -1,0 +1,16 @@
+# Sit this proxy in front of Ghost (change the published port / networks to match
+# your existing stack). Point your TLS terminator or nginx at this service instead
+# of Ghost, or proxy only /members to it.
+services:
+  signup-shield:
+    build:
+      context: ..
+      dockerfile: sidecar/Dockerfile
+    environment:
+      GHOST_ORIGIN: http://ghost:2368
+      SITE_TITLE: My Publication
+      INTERSTITIAL_ACTIONS: signup,subscribe,signup-paid
+      CONFIRM_SECRET: change-me
+    ports:
+      - "8787:8787"
+    # extra_hosts / networks: attach this to the same docker network as Ghost

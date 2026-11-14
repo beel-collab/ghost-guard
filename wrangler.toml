@@ -1,0 +1,34 @@
+name = "ghost-guard"
+main = "src/worker.js"
+compatibility_date = "2026-11-01"
+
+# After deploy, attach this Worker to your Ghost hostname:
+#   wrangler deploy
+# then in the Cloudflare dashboard, add a route:
+#   example.com/members*
+# and (optional, for webhook cleanup mode):
+#   example.com/signup-shield/*
+
+# Secrets (set with `wrangler secret put NAME`, never commit them):
+#   CONFIRM_SECRET          shared header so the Worker can reach Ghost without looping
+#   GHOST_ORIGIN            optional direct origin, e.g. https://origin.example.com (DNS-only)
+#   TURNSTILE_SECRET        optional, only if TURNSTILE_SITE_KEY is also set
+#   ADMIN_API_KEY           optional, Ghost Admin API key for webhook cleanup mode
+#   WEBHOOK_SECRET          optional, if you set a secret on the Ghost custom integration
+
+[vars]
+# Comma-separated magic-link actions that require a click to confirm.
+# Sign-in links (action=signin) are left as a plain GET, matching Ghost today.
+INTERSTITIAL_ACTIONS = "signup,subscribe,signup-paid"
+SITE_TITLE = "this publication"
+# Set a public Turnstile site key to put a challenge on the confirm page.
+# Leave empty for click-only (enough for most corporate scanners).
+TURNSTILE_SITE_KEY = ""
+# Webhook cleanup mode (Ghost(Pro) or any host). Leave empty to disable.
+ADMIN_API_URL = ""
+CLEANUP_MODE = "label"
+CLEANUP_LABEL = "signup-shield-review"
+# Optional: only act on free members whose email domain is not in this list.
+# Leave empty to label every new free member for review (safest default is off — see README).
+CLEANUP_SKIP_DOMAINS = "gmail.com,googlemail.com,yahoo.com,outlook.com,hotmail.com,icloud.com,proton.me,protonmail.com,me.com,live.com,msn.com,aol.com,mail.com"
+CLEANUP_ENABLED = "false"
