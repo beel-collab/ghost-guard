@@ -6,6 +6,8 @@ services:
     environment:
       GHOST_ORIGIN: http://ghost:2368
       SITE_TITLE: My Publication
+      # Subfolder Ghost is installed in, e.g. /blog; empty for the domain root.
+      GHOST_BASE_PATH: ${GHOST_BASE_PATH:-}
       INTERSTITIAL_ACTIONS: signup,subscribe,signup-paid
       TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
       SIGNUP_IP_LIMIT: ${SIGNUP_IP_LIMIT:-5}

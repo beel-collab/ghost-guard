@@ -21,6 +21,19 @@ const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    let base;
+    try {
+      base = ghostBasePath(env);
+    } catch (error) {
+      // Fail closed where protection is at stake: anything that could be a
+      // members route. The rest of the site keeps working.
+      if (/\/members(\/|$)/.test(canonicalPath(url.pathname))) {
+        console.error(`ghost-guard: ${error.message}`);
+        return new Response('Signups are temporarily unavailable.', { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+      }
+      base = '';
+    }
+    const local = ghostPath(url, base);
 
     if (url.pathname === '/ghost-guard/turnstile.js') {
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -29,7 +42,7 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    if (url.pathname.replace(/\/+$/, '').toLowerCase() === '/members/api/send-magic-link' && request.method === 'POST') {
+    if (local === '/members/api/send-magic-link' && request.method === 'POST') {
       return handleSendMagicLink(request, env);
     }
 
@@ -37,10 +50,14 @@ export default {
       return handleMemberAddedWebhook(request, env);
     }
 
-    if (isMembersMagicLink(url)) {
+    if (local === '/members' && url.searchParams.has('token')) {
       return handleMagicLink(request, url, env);
     }
 
+    // Outside a subfolder install the path belongs to whatever else serves this
+    // hostname, so send it to the zone's normal origin, not to Ghost. The
+    // sidecar has no zone origin and only receives Ghost's paths anyway.
+    if (local === null && !env.SIDECAR) return forwardToOrigin(request, { ...env, GHOST_ORIGIN: '' });
     return forwardToOrigin(request, env);
   },
 };
@@ -101,9 +118,32 @@ function portalError(message, status, headers = {}) {
   });
 }
 
-function isMembersMagicLink(url) {
-  const path = url.pathname.replace(/\/+$/, '').toLowerCase() || '/';
-  return path === '/members' && url.searchParams.has('token');
+// GHOST_BASE_PATH: the subfolder Ghost is installed under (e.g. "/blog" for
+// example.com/blog), or empty for the domain root. Returned lowercased with a
+// leading slash and no trailing one, since Ghost's routes ignore case.
+// Rejects anything a request path could never match (dot or empty segments,
+// query or fragment characters), so a typo fails closed instead of open.
+export function ghostBasePath(env) {
+  const path = String(env.GHOST_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!path) return '';
+  const valid = path.split('/').every((segment) => /^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$/.test(segment) && segment !== '.' && segment !== '..');
+  if (!valid) throw new Error('GHOST_BASE_PATH must be a plain path such as /blog');
+  return `/${path.toLowerCase()}`;
+}
+
+// Lowercased, without trailing slashes, and with repeated slashes collapsed:
+// Express routes "/members//api/…" and "/blog//members/…" to Ghost's handlers,
+// so the guard must treat them as the paths Ghost will serve.
+function canonicalPath(pathname) {
+  return pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+// The request path relative to the Ghost install, or null when the request is
+// outside the install.
+function ghostPath(url, base) {
+  const path = canonicalPath(url.pathname);
+  if (base && path !== base && !path.startsWith(`${base}/`)) return null;
+  return path.slice(base.length) || '/';
 }
 
 function interstitialActions(env) {

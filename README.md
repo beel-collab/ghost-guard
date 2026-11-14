@@ -39,6 +39,8 @@ example.com/*
 
 Route the **whole hostname** through the Worker. Ghost accepts case variants such as `/Members/API/Send-Magic-Link/`; a case-sensitive `/members*` Cloudflare route leaves those requests unprotected. The Worker protects the signup API and confirmation links, serves the Code Injection script and optional webhook, and forwards all other traffic to Ghost. Replace any older narrow routes for this Worker when updating an installation.
 
+**Ghost in a subfolder.** If Ghost's `url` has a path, such as `https://example.com/blog`, set **`GHOST_BASE_PATH`** to it (`/blog`) in `wrangler.toml` `[vars]`; `wrangler deploy` replaces values set only in the dashboard. Signups then go to `/blog/members/api/send-magic-link/` and links to `/blog/members/?token=…`, and the Worker protects those paths instead of the root ones, ignoring case and repeated slashes like Ghost. Without this setting a subfolder install gets no protection. Requests outside the subfolder, including root `/members` paths, are not Ghost's: the Worker passes them to the hostname's normal Cloudflare origin rather than `GHOST_ORIGIN`, so a separate site at the root keeps working. A value a request path could never match, such as one containing `?`, `..` or `//`, makes member paths answer 500 (and logs why) rather than guess; the rest of the site keeps working. The script and webhook stay at the domain root (`/ghost-guard/…`, `/signup-shield/…`), so keep the route on the whole hostname.
+
 ### Enable Turnstile on signup requests
 
 1. Create a **Managed** Turnstile widget in Cloudflare, allowing your public Ghost hostname.
@@ -48,6 +50,8 @@ Route the **whole hostname** through the Worker. Ghost accepts case variants suc
 ```html
 <script src="/ghost-guard/turnstile.js" data-sitekey="YOUR_PUBLIC_TURNSTILE_SITE_KEY"></script>
 ```
+
+The script covers any same-site path ending in `/members/api/send-magic-link`, so it needs no extra setting for Ghost in a subfolder; the server decides which paths it protects.
 
 Save, then reload the public site before testing. Use Site Header, not an individual post's injection. Do not add `async` to this snippet. The Worker and sidecar both serve this URL. The public key is only in the snippet; `TURNSTILE_SITE_KEY` is no longer a server setting.
 
@@ -111,6 +115,8 @@ location /ghost-guard/ {
 }
 ```
 
+For Ghost in a subfolder, set `GHOST_BASE_PATH` (for example `/blog`). Ghost-CLI's subfolder config serves Ghost from `location ^~ /blog`, and a `^~` prefix match stops nginx from checking regex locations, so a separate `/blog/members` regex location would never be used. Instead, point that existing `/blog` location's `proxy_pass` at the sidecar (`http://127.0.0.1:8787`), keeping its other directives: the sidecar protects the member paths and passes everything else under `/blog` to `GHOST_ORIGIN`. Keep `/ghost-guard/` (and `/signup-shield/` if used) at the root as above. The sidecar refuses to start with an invalid base path.
+
 The sidecar uses the TCP peer's IP and protocol by default and ignores client-supplied `CF-Connecting-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto`. It rebuilds the upstream IP headers from the resolved client IP, preserving Ghost's own authentication throttling, and strips hop-by-hop headers in both directions. Chunked request bodies are buffered and reframed for the upstream connection. Behind nginx/Caddy, set **`TRUSTED_PROXIES`** to the addresses your proxies connect from (comma-separated IPs or CIDR ranges). Without it, every reader shares the proxy's address, so the whole site gets one IP quota and Ghost's own throttling sees one client. The Docker Compose file defaults to loopback plus Docker's default bridge range (`127.0.0.1,::1,172.16.0.0/12`), where a host or container proxy connects from; narrow it to your proxy's address if untrusted containers share the network. Do not list ranges your readers connect from, such as a LAN: listed addresses are skipped as proxies, so a reader inside one could choose their IP. If your Docker networks use other ranges, add them. When an unlisted peer sends `X-Forwarded-For` or `X-Forwarded-Proto`, the sidecar logs one warning, the usual sign that this setting is missing or wrong. Entries with a port (`203.0.113.1:5555`) are accepted; an entry that is not an IP address falls back to the connecting peer. Only a listed peer may set `X-Forwarded-For` and `X-Forwarded-Proto`. The sidecar walks `X-Forwarded-For` from the right, skipping listed proxies, and uses the first other entry as the client, so it is correct whether the proxy overwrites the header (as above) or appends to it (`$proxy_add_x_forwarded_for`, Ghost-CLI's default), and with several proxy hops if each is listed. The proxy must set `X-Forwarded-For` itself: one that passes the client's header through unchanged lets clients choose their IP. It should also set `X-Forwarded-Proto` to the public request scheme. The older `TRUST_PROXY=true` still works but trusts every peer and uses the rightmost entry; it logs a warning at startup. The scheme must be preserved on signup and confirmation requests so Ghost does not redirect to an internal HTTPS address. Prevent direct access to the sidecar from anything but the proxy. Ensure no other nginx location takes precedence and sends case variants directly to Ghost. Leave `TRUSTED_PROXIES` unset only when clients connect to the sidecar directly. In Workers, Cloudflare supplies `CF-Connecting-IP`, and the Worker replaces any client-sent `X-Forwarded-For` with it before forwarding, because Ghost trusts the leftmost entry and Cloudflare only appends to what the client sent.
 
 Use the same Code Injection snippet above for sidecar Turnstile. Its secret and quota variables are supplied through environment variables; `CONFIRM_SECRET` is unnecessary when the sidecar forwards directly to Ghost.
@@ -136,7 +142,7 @@ In `wrangler.toml` or the dashboard:
 
 ```toml
 CLEANUP_ENABLED = "true"
-ADMIN_API_URL = "https://your-site.ghost.io"
+ADMIN_API_URL = "https://your-site.ghost.io"   # include the subfolder, e.g. https://example.com/blog
 ```
 
 Create a **Custom Integration** in Ghost Admin with a **Member added** webhook targeting:
@@ -158,6 +164,7 @@ The Worker routes each member's deliveries through the same **`MemberLabeller` D
 | `GHOST_ORIGIN` | Worker: same-zone; sidecar: `http://127.0.0.1:2368` | Direct Ghost origin; Worker secret recommended |
 | `CONFIRM_SECRET` | unset | Worker's secret bypass header for confirmation forwarding |
 | `SITE_TITLE` | `this publication` | Name on the confirmation page |
+| `GHOST_BASE_PATH` | unset (domain root) | Subfolder Ghost is installed in, such as `/blog`; set it in `wrangler.toml` so deploys keep it |
 | `INTERSTITIAL_ACTIONS` | `signup,subscribe,signup-paid` | Magic-link actions requiring a click |
 | `TURNSTILE_SECRET` | unset | Enables server-side Turnstile on signup requests only |
 | `TURNSTILE_HOSTNAME` | request hostname | Expected verified Turnstile hostname |
@@ -172,7 +179,7 @@ The Worker routes each member's deliveries through the same **`MemberLabeller` D
 | `TRUSTED_PROXIES` | unset (loopback and `172.16.0.0/12` in Docker Compose) | Sidecar only: addresses or CIDR ranges allowed to set X-Forwarded-For/-Proto |
 | `TRUST_PROXY` | `false` | Sidecar only, legacy: `true` trusts forwarded headers from any peer; prefer `TRUSTED_PROXIES` |
 | `CLEANUP_ENABLED` | `false` | Enables label-only webhook when exactly `true` |
-| `ADMIN_API_URL` | unset | Ghost Admin origin for the webhook |
+| `ADMIN_API_URL` | unset | Ghost site URL for the webhook's Admin API calls, including any subfolder (`https://example.com/blog`) |
 | `ADMIN_API_KEY` | unset | Secret `id:secret` Custom Integration key |
 | `WEBHOOK_SECRET` | unset | Required webhook signing secret when enabled |
 | `CLEANUP_SKIP_DOMAINS` | See `wrangler.toml` | Comma-separated domains excluded from review |

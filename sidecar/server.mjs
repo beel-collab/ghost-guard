@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import worker from '../src/worker.js';
+import worker, { ghostBasePath } from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
 import { LocalLabelQueue } from '../src/webhook.js';
 
@@ -85,10 +85,13 @@ function resolveClient(req, trust) {
 }
 
 export function createGuardServer(env = process.env) {
+  ghostBasePath(env); // Refuse to start with a GHOST_BASE_PATH that cannot match.
   const trust = proxyTrust(env);
   let warnedUntrusted = false;
   const workerEnv = {
     ...env,
+    // Every path goes to GHOST_ORIGIN: the sidecar has no other origin to use.
+    SIDECAR: true,
     GHOST_ORIGIN: (env.GHOST_ORIGIN || 'http://127.0.0.1:2368').replace(/\/+$/, ''),
     LOCAL_RATE_LIMITER: new MemoryRateLimiter(),
     LOCAL_MEMBER_LABELLER: new LocalLabelQueue(),

@@ -120,3 +120,13 @@ test('case-variant signup URLs receive a fresh Turnstile token too', async () =>
   assert.equal(b.requests[0].headers.get('cf-turnstile-response'), 'token-1');
   assert.equal(b.requests[0].url, 'https://blog.example/Members/API/Send-Magic-Link/');
 });
+
+test('subfolder installs and doubled slashes get a token without extra settings', async () => {
+  const b = browser();
+  await b.window.fetch('/blog/members/api/send-magic-link/', options());
+  await b.window.fetch('https://blog.example/Blog/Members/api/send-magic-link', options());
+  await b.window.fetch('/members//api/send-magic-link', options());
+  await b.window.fetch('/blog/members/api/send-magic-link-preview', options());
+  assert.deepEqual(b.calls.slice(0, 3).map(([request]) => request.headers.get('cf-turnstile-response')), ['token-1', 'token-2', 'token-3']);
+  assert.equal(b.calls[3][0], '/blog/members/api/send-magic-link-preview');
+});

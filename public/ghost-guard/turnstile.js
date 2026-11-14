@@ -81,7 +81,10 @@
     // Never inspect or change requests to other endpoints or other sites.
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, window.location.href);
     const method = (init?.method || input?.method || 'GET').toUpperCase();
-    if (url.origin !== window.location.origin || url.pathname.replace(/\/+$/, '').toLowerCase() !== '/members/api/send-magic-link' || method !== 'POST') {
+    // Any same-site path ending in the signup API, so Ghost in a subfolder
+    // (/blog/members/...) needs no extra setting; the server decides what counts.
+    const path = url.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase();
+    if (url.origin !== window.location.origin || !path.endsWith('/members/api/send-magic-link') || method !== 'POST') {
       return originalFetch(input, init);
     }
     // Inspect a clone: constructing from a Request transfers its body, which

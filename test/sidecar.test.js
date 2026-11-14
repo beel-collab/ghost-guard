@@ -267,3 +267,22 @@ test('forwarded headers from an unlisted peer log one warning', async (t) => {
   assert.equal(warnings.mock.callCount(), 1);
   assert.match(String(warnings.mock.calls[0].arguments), /127\.0\.0\.1.*TRUSTED_PROXIES/);
 });
+
+test('sidecar protects a subfolder install end to end and refuses an invalid base path', async (t) => {
+  const { guard, calls } = await setup(t, { GHOST_BASE_PATH: '/blog', SIGNUP_IP_LIMIT: '1' });
+  const post = (email) => fetch(`${guard}/blog/members/api/send-magic-link/`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, emailType: 'signup' }),
+  });
+  assert.equal((await post('reader@work.example')).status, 201);
+  assert.equal((await post('other@work.example')).status, 429);
+  const page = await fetch(`${guard}/blog/members/?token=abc&action=signup`);
+  assert.match(await page.text(), /Confirm signup/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/blog/members/api/send-magic-link/');
+  // Paths outside the subfolder still go to GHOST_ORIGIN; the sidecar has no other origin.
+  assert.equal((await fetch(`${guard}/pricing`)).status, 201);
+  assert.equal(calls[1].url, '/pricing');
+  for (const bad of ['/blog?x', '/blog/..', '/blog//x']) {
+    assert.throws(() => createGuardServer({ GHOST_BASE_PATH: bad }), /GHOST_BASE_PATH/);
+  }
+});
