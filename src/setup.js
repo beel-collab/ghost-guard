@@ -282,7 +282,8 @@ async function writeConfig(env, value, expectedRevision) {
 
 async function readWidgetSecret(env, sitekey) {
   const res = await storeFetch(env, '/widget-secret');
-  if (!res.ok) return '';
+  // Never rotate on a failed read: the new secret could not be kept either.
+  if (!res.ok) throw httpError('Fix: setup storage is unavailable. Try again shortly.', 503);
   const kept = (await res.json())?.value;
   return kept?.sitekey === sitekey ? kept.secret || '' : '';
 }
