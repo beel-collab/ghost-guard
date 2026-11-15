@@ -60,8 +60,14 @@ export class LocalLabelQueue {
   }
 
   // Resolves once every queued label and scheduled retry has finished.
+  // Retry timers are unref'd, so hold the process open while someone waits.
   async idle() {
-    while (this.inflight.size) await Promise.all([...this.inflight]);
+    const keepAlive = setInterval(() => {}, 60_000);
+    try {
+      while (this.inflight.size) await Promise.all([...this.inflight]);
+    } finally {
+      clearInterval(keepAlive);
+    }
   }
 
   #attempt(key, operation, attempt) {
@@ -70,11 +76,9 @@ export class LocalLabelQueue {
       if (attempt >= this.delays.length) return logFailure(error, 'giving up after all retries');
       logFailure(error, 'retrying');
       return new Promise((resolve) => {
-        const timer = setTimeout(resolve, this.delays[attempt]);
         // Unref so a pending retry cannot hold a sidecar process open after the
-        // server stops. The test runner treats an empty ref list as "done" and
-        // would cancel the test before a zero-delay retry runs.
-        if (!process.env.NODE_TEST_CONTEXT) timer.unref?.();
+        // server stops.
+        setTimeout(resolve, this.delays[attempt]).unref?.();
       }).then(() => this.#attempt(key, operation, attempt + 1));
     });
     const tracked = run.finally(() => this.inflight.delete(tracked));
@@ -300,7 +304,7 @@ async function adminApiRequest(env, path, { method = 'GET', body } = {}) {
 // Ghost Admin API keys: a 24-hex-digit key ID and a 64-hex-digit secret.
 export const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
 
-export async function adminApiHeaders(adminApiKey, version = 'v6.0') {
+async function adminApiHeaders(adminApiKey) {
   const apiKey = String(adminApiKey).trim();
   if (!ADMIN_KEY_PATTERN.test(apiKey)) throw terminalError('ADMIN_API_KEY must be in id:secret form');
   const [id, secret] = apiKey.split(':');
@@ -330,7 +334,7 @@ export async function adminApiHeaders(adminApiKey, version = 'v6.0') {
   return {
     Authorization: `Ghost ${data}.${sig}`,
     'Content-Type': 'application/json',
-    'Accept-Version': version,
+    'Accept-Version': 'v6.0',
   };
 }
 

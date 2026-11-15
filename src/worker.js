@@ -14,7 +14,7 @@ import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.
 export { SignupRateLimiter } from './rate-limit.js';
 import { handleMemberAddedWebhook } from './webhook.js';
 export { MemberLabeller } from './webhook.js';
-import { handleSetup, pageHeaders, withStoredConfig } from './setup.js';
+import { escapeHtml, handleSetup, pageHeaders, withStoredConfig } from './setup.js';
 export { SetupStore } from './setup.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
@@ -44,8 +44,10 @@ async function handleRequest(request, env) {
   // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
   // requests use the same rule, so a lookalike path on a root app still
   // reaches that app after the checks.
+  // If setup storage is down, plain forwarding falls back to the deployment's
+  // own settings rather than taking every page and asset down with it.
   const forward = async (forwarded) => {
-    const routingEnv = env.GHOST_ORIGIN && env.SETUP_STORE ? await config() : env;
+    const routingEnv = env.GHOST_ORIGIN && env.SETUP_STORE ? await config().catch(() => env) : env;
     return routingEnv.SIDECAR === true || insideGhost(path, routingEnv)
       ? forwardToOrigin(forwarded, routingEnv)
       : forwardToZone(forwarded);
@@ -354,15 +356,6 @@ function htmlHeaders() {
   // Chromium also checks form-action on that redirect after consuming the token.
   headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
   return headers;
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 function renderInterstitial(url, env, error) {

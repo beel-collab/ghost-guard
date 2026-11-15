@@ -32,8 +32,10 @@ function nonempty(value) {
 export function mergeConfig(env, stored) {
   if (!stored || typeof stored !== 'object') return env;
   const next = { ...env };
-  if (Object.hasOwn(stored, 'turnstileSecret')) {
-    next.TURNSTILE_SECRET = stored.turnstileEnabled === false ? '' : stored.turnstileSecret;
+  // A prepared widget takes over only once activated. Until then a manually
+  // configured TURNSTILE_SECRET (if any) keeps protecting signups.
+  if (Object.hasOwn(stored, 'turnstileSecret') && stored.turnstileEnabled !== false) {
+    next.TURNSTILE_SECRET = stored.turnstileSecret;
     next.TURNSTILE_HOSTNAME = stored.hostname || '';
   }
   if (Object.hasOwn(stored, 'ghostBasePath')) next.GHOST_BASE_PATH = stored.ghostBasePath;
@@ -57,7 +59,7 @@ export async function withStoredConfig(env) {
   }
 }
 
-function escapeHtml(value) {
+export function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -215,6 +217,16 @@ export class SetupStore {
       await this.storage.put(key, { count, expires });
       return Response.json({ ok: false, limited: false });
     }
+    // A rotated widget secret is kept here at once, outside the revision
+    // check, so a later failed save cannot lose it.
+    if (request.method === 'PUT' && pathname === '/widget-secret') {
+      const { sitekey, secret } = await request.json();
+      await this.storage.put('widgetSecret', { sitekey: String(sitekey || '').slice(0, 64), secret: String(secret || '').slice(0, 256) });
+      return Response.json({ ok: true });
+    }
+    if (request.method === 'GET' && pathname === '/widget-secret') {
+      return Response.json({ value: (await this.storage.get('widgetSecret')) || null });
+    }
     if (request.method === 'GET' && pathname === '/config') {
       const value = await this.storage.get('config');
       return Response.json({ value: value || null });
@@ -265,6 +277,18 @@ async function writeConfig(env, value, expectedRevision) {
   return (await res.json()).value;
 }
 
+async function readWidgetSecret(env, sitekey) {
+  const res = await storeFetch(env, '/widget-secret');
+  if (!res.ok) return '';
+  const kept = (await res.json())?.value;
+  return kept?.sitekey === sitekey ? kept.secret || '' : '';
+}
+
+async function keepWidgetSecret(env, sitekey, secret) {
+  const res = await storeFetch(env, '/widget-secret', { method: 'PUT', body: JSON.stringify({ sitekey, secret }) });
+  if (!res.ok) throw httpError('Fix: the rotated Turnstile secret could not be stored. Run setup again within two hours, before the previous secret expires.', 503);
+}
+
 async function expectedToken(env) {
   const configured = typeof env.SETUP_TOKEN === 'string' ? env.SETUP_TOKEN.trim() : '';
   if (configured) return { token: configured, source: 'env' };
@@ -292,12 +316,17 @@ async function digest(value) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export function scriptNameFrom(request, env) {
+// On a custom hostname the request says nothing about the script name, so a
+// rerun there reuses the name saved by the first (workers.dev) run.
+export function scriptNameFrom(request, env, stored) {
+  const valid = (name) => /^[a-z0-9][a-z0-9-]{0,62}$/i.test(name);
   const configured = String(env.SCRIPT_NAME || '').trim();
-  if (/^[a-z0-9][a-z0-9-]{0,62}$/i.test(configured)) return configured;
+  if (valid(configured)) return configured;
   const host = new URL(request.url).hostname.toLowerCase();
   const match = host.match(/^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/);
-  return match ? match[1] : 'ghost-guard';
+  if (match) return match[1];
+  const saved = String(stored?.scriptName || '');
+  return valid(saved) ? saved : 'ghost-guard';
 }
 
 function layout(title, body) {
@@ -555,7 +584,7 @@ export async function handleSetup(request, env) {
     const cfToken = String(form.get('cf_api_token') || '');
     const adminKey = String(form.get('admin_api_key') || '').trim();
     secrets.push(cfToken, values.webhook_secret, adminKey, adminKey.split(':')[1]);
-    const result = await runSetup({ request, env, values, cfToken, adminKey, secrets });
+    const result = await runSetup({ request, env, previous: config, values, cfToken, adminKey, secrets });
     return htmlResponse(200, renderResult(result));
   } catch (error) {
     const status = error.status || 500;
@@ -593,6 +622,18 @@ async function parseSite(values) {
   const ghostBasePath = rawBase ? await normalizeBasePath(rawBase) : '';
   const siteUrl = `${url.origin}${ghostBasePath}`;
   return { hostname, ghostBasePath, siteUrl };
+}
+
+// With GHOST_ORIGIN, a Worker fetch to the public hostname skips the Worker and
+// reaches the zone origin, which may not be Ghost. Call Ghost where the Worker
+// forwards its traffic instead.
+function adminApiUrlFor(env, site) {
+  if (!env.GHOST_ORIGIN) return site.siteUrl;
+  try {
+    return `${new URL(env.GHOST_ORIGIN).origin}${site.ghostBasePath}`;
+  } catch {
+    throw httpError('Fix: GHOST_ORIGIN must be an https URL such as https://origin.example.com.', 400);
+  }
 }
 
 async function cfFetch(token, url, options = {}) {
@@ -681,7 +722,7 @@ async function listWidgets(token, accountId) {
   return widgets;
 }
 
-async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
+async function runSetup({ request, env, previous, values, cfToken, adminKey, secrets }) {
   if (!nonempty(cfToken) || cfToken.length > 4096) throw httpError('Fix: enter a Cloudflare API token.', 400);
   if (values.webhook && !ADMIN_KEY_PATTERN.test(adminKey)) {
     throw httpError('Fix: the Ghost Admin API key must be the id:secret value from a custom integration.', 400);
@@ -693,10 +734,11 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
     throw httpError('Fix: the account ID is the 32-character id from the Cloudflare dashboard, or leave it blank.', 400);
   }
   const site = await parseSite(values);
-  const scriptName = scriptNameFrom(request, env);
-  const previous = await readConfig(env);
+  const scriptName = scriptNameFrom(request, env, previous);
   const ctx = {
     ...site,
+    adminApiUrl: adminApiUrlFor(env, site),
+    env,
     scriptName,
     accountId: values.account_id.toLowerCase(),
     webhookEnabled: values.webhook === true,
@@ -725,7 +767,7 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
     turnstileEnabled: previous?.turnstileEnabled !== false && previous?.turnstileSitekey === ctx.turnstileSitekey && previous?.hostname === ctx.hostname,
     webhookEnabled: ctx.webhookEnabled,
     webhookSecret: ctx.webhookEnabled ? values.webhook_secret : '',
-    adminApiUrl: ctx.webhookEnabled ? ctx.siteUrl : '',
+    adminApiUrl: ctx.webhookEnabled ? ctx.adminApiUrl : '',
     adminApiKey: ctx.webhookEnabled ? adminKey : '',
     scriptName,
     checklist: [],
@@ -783,16 +825,17 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
         const detail = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/accounts/${ctx.accountId}/challenges/widgets/${encodeURIComponent(widget.sitekey)}`);
         widget = { ...widget, ...detail.result };
       }
-      const stored = await readConfig(env);
-      if (!widget.secret && stored?.turnstileSitekey === widget.sitekey && stored.turnstileSecret) {
-        widget = { ...widget, secret: stored.turnstileSecret };
+      if (!widget.secret && previous?.turnstileSitekey === widget.sitekey && previous.turnstileSecret) {
+        widget = { ...widget, secret: previous.turnstileSecret };
       }
+      if (!widget.secret) widget = { ...widget, secret: await readWidgetSecret(env, widget.sitekey) };
       if (!widget.secret) {
         const rotated = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/accounts/${ctx.accountId}/challenges/widgets/${encodeURIComponent(widget.sitekey)}/rotate_secret`, {
           method: 'POST',
           body: { invalidate_immediately: false },
         });
         widget = { ...widget, secret: rotated.result?.secret, sitekey: rotated.result?.sitekey || widget.sitekey };
+        if (widget.secret) await keepWidgetSecret(env, widget.sitekey, widget.secret);
       }
     } else {
       const created = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/accounts/${ctx.accountId}/challenges/widgets`, {
@@ -823,13 +866,17 @@ async function readLimited(res) {
   return text.slice(0, 100_000);
 }
 
-async function runChecks(ctx) {
-  const checks = [];
-  checks.push(await checkRoute(ctx));
-  checks.push(await checkTurnstile(ctx));
-  checks.push(await checkConfirm(ctx));
-  checks.push(await checkSignin(ctx));
-  return checks;
+function runChecks(ctx) {
+  return Promise.all([checkRoute(ctx), checkTurnstile(ctx), checkConfirm(ctx), checkSignin(ctx)]);
+}
+
+// A Worker fetch to its own hostname skips the Worker and reaches the origin.
+// When setup runs on that hostname, send the check through this Worker's
+// handler so it still exercises the guard.
+async function guardFetch(ctx, url, init) {
+  if (ctx.requestHost !== ctx.hostname) return fetch(url, init);
+  const { default: worker } = await import('./worker.js');
+  return worker.fetch(new Request(url, init), ctx.env);
 }
 
 async function checkRoute(ctx) {
@@ -883,7 +930,7 @@ async function checkConfirm(ctx) {
   const title = 'Confirmation page';
   const url = `https://${ctx.hostname}${ctx.ghostBasePath}/members/?token=x&action=signup`;
   try {
-    const res = await fetch(url, { redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(10_000) });
+    const res = await guardFetch(ctx, url, { redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(10_000) });
     const text = await readLimited(res);
     if (res.status === 200 && text.includes('Confirm signup')) {
       return { title, ok: true, detail: 'A fake signup link showed the confirmation page. The token was not exchanged and no member was created.' };
@@ -898,7 +945,7 @@ async function checkSignin(ctx) {
   const title = 'Sign-in passthrough';
   const url = `https://${ctx.hostname}${ctx.ghostBasePath}/members/api/send-magic-link/`;
   try {
-    const res = await fetch(url, {
+    const res = await guardFetch(ctx, url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ email: 'ghost-guard-setup-check@example.invalid', emailType: 'signin' }),
@@ -910,8 +957,11 @@ async function checkSignin(ctx) {
     if (/Unable to verify your request|Too many sign-up attempts|Signup protection is temporarily unavailable/.test(text)) {
       return { title, ok: false, detail: 'Fix: sign-in requests should skip Turnstile and quotas. Deploy the current Worker and run setup again.' };
     }
-    if (!res.ok) return { title, ok: false, detail: `Fix: Ghost returned HTTP ${res.status} for the sign-in check. Verify sign-in manually on your public site.` };
-    return { title, ok: true, detail: 'A sign-in for a reserved nonexistent address was not blocked. No member was created.' };
+    // Ghost rejects sign-in for an unknown member with a 4xx JSON error, which
+    // still proves the request reached it. A 404 means it reached no members API.
+    const reachedGhost = res.ok || (res.status >= 400 && res.status < 500 && res.status !== 404 && /"errors"/.test(text));
+    if (!reachedGhost) return { title, ok: false, detail: `Fix: Ghost returned HTTP ${res.status} for the sign-in check. Verify sign-in manually on your public site.` };
+    return { title, ok: true, detail: 'A sign-in for a reserved nonexistent address reached Ghost without a challenge or quota. No member was created.' };
   } catch {
     return { title, ok: false, detail: 'Fix: the sign-in request could not be sent. Check that Ghost is reachable through the Worker route.' };
   }
