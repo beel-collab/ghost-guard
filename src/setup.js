@@ -4,7 +4,7 @@
  */
 import { ADMIN_KEY_PATTERN } from './webhook.js';
 import { ipBucket } from './rate-limit.js';
-import { forgetStoredConfig, readStoredConfig } from './config.js';
+import { forgetStoredConfig, readStoredConfig, storeStub } from './config.js';
 
 export const GUARD_START = '<!-- ghost-guard:start -->';
 export const GUARD_END = '<!-- ghost-guard:end -->';
@@ -102,6 +102,7 @@ export function sanitizeConfig(input) {
     turnstileSitekey: String(source.turnstileSitekey || '').slice(0, 64),
     turnstileSecret: String(source.turnstileSecret || '').slice(0, 256),
     turnstileEnabled: source.turnstileEnabled !== false,
+    turnstileVerified: source.turnstileVerified === true,
     webhookEnabled,
     webhookSecret: webhookEnabled ? String(source.webhookSecret || '').slice(0, MAX_WEBHOOK_SECRET_LENGTH) : '',
     adminApiUrl: webhookEnabled ? String(source.adminApiUrl || '').slice(0, 500) : '',
@@ -212,7 +213,7 @@ export class SetupStore {
         return Response.json({ error: 'Prepare Cloudflare and install the Ghost snippet before activating.' }, { status: 400 });
       }
       // Activating a secret Turnstile rejected would fail every signup.
-      if (pathname === '/activate' && !current.checklist?.some((item) => item.title === TURNSTILE_CHECK && item.ok)) {
+      if (pathname === '/activate' && current.turnstileVerified !== true) {
         return Response.json({ error: 'Fix: the last setup run could not confirm the Turnstile widget. Run setup again, then activate.' }, { status: 400 });
       }
       const value = sanitizeConfig(pathname === '/activate' ? { ...current, turnstileEnabled: true } : body.value);
@@ -223,11 +224,6 @@ export class SetupStore {
   }
 }
 
-function storeStub(env) {
-  if (!env.SETUP_STORE) return null;
-  return env.SETUP_STORE.get(env.SETUP_STORE.idFromName('setup'));
-}
-
 async function storeFetch(env, pathname, init) {
   const stub = storeStub(env);
   if (!stub) throw httpError('Fix: the SETUP_STORE binding is missing. Deploy the current wrangler.toml so the v3 migration runs.', 503);
@@ -236,10 +232,6 @@ async function storeFetch(env, pathname, init) {
     headers: init?.body ? { 'content-type': 'application/json' } : undefined,
     body: init?.body,
   }));
-}
-
-function readConfig(env) {
-  return readStoredConfig(env);
 }
 
 async function writeConfig(env, value, expectedRevision) {
@@ -268,11 +260,7 @@ async function expectedToken(env) {
   if (configured) return { token: configured, source: 'env' };
   const res = await storeFetch(env, '/token', { method: 'POST' });
   if (!res.ok) throw httpError('Fix: the setup token could not be stored. Deploy the current wrangler.toml and try again.', 503);
-  const body = await res.json();
-  // Logged on every setup request, not only when created: the operator often
-  // starts `wrangler tail` after the first visit. Worker logs are owner-only.
-  console.log(`ghost-guard: SETUP_TOKEN is not set. Setup token: ${body.token}. Enter it at /ghost-guard/setup. It is not shown on the setup page. To set your own, run: npx wrangler secret put SETUP_TOKEN`);
-  return { token: body.token, source: 'stored' };
+  return { token: (await res.json()).token, source: 'stored' };
 }
 
 async function authorize(request, env, provided, expected) {
@@ -446,6 +434,7 @@ function renderResult({ steps, checks, secrets, values, ok, config }) {
 
 function renderGhostSteps(config) {
   const active = config.turnstileEnabled !== false;
+  const activatable = !active && config.turnstileVerified === true;
   const hook = config.webhookEnabled ? `<h2>Optional webhook labeller</h2>
     <p>In Ghost Admin → Settings → Advanced → Integrations, open the custom integration for the key you supplied. Add a <strong>Member added</strong> webhook with this target:</p>
     <pre>${escapeHtml(`https://${config.hostname}/signup-shield/webhooks/member-added`)}</pre>
@@ -454,7 +443,7 @@ function renderGhostSteps(config) {
     <p>In Ghost Admin → Settings → Advanced → Code injection → Site Header, paste this block and save. Replace any earlier ghost-guard block; keep your other header HTML.</p>
     <pre>${escapeHtml(codeInjectionSnippet(config.turnstileSitekey))}</pre>
     <p>${active ? 'Turnstile signup protection is active.' : 'Turnstile is waiting for activation. IP and email quotas and the confirmation page are already active.'}</p>
-    ${active ? '' : `<form method="post" action="/ghost-guard/setup" autocomplete="off">
+    ${active ? '' : !activatable ? '<p class="error">Fix: this run could not confirm the Turnstile widget secret. Run setup again before activating.</p>' : `<form method="post" action="/ghost-guard/setup" autocomplete="off">
       <input type="hidden" name="intent" value="activate">
       <input type="hidden" name="config_revision" value="${escapeHtml(config.revision || '')}">
       <label class="check"><input name="snippet_installed" type="checkbox" required> I saved the snippet in Ghost Site Header.</label>
@@ -541,11 +530,18 @@ export async function handleSetup(request, env) {
     const tokenInfo = await expectedToken(env);
     secrets.push(tokenInfo.token);
     if (request.method === 'GET') {
-      const config = await readConfig(env);
-      if (config?.complete && url.searchParams.get('rerun') !== '1') {
-        return htmlResponse(200, renderGate({ generated: tokenInfo.source === 'stored' }));
+      const config = await readStoredConfig(env);
+      // Repeated on each page load until setup completes: the operator often
+      // starts `wrangler tail` after the first visit, or a crawler got there
+      // first. Never logged for POSTs, and not once setup has used the token.
+      const generated = tokenInfo.source === 'stored' && !config?.complete;
+      if (generated) {
+        console.log(`ghost-guard: SETUP_TOKEN is not set. Setup token: ${tokenInfo.token}. Enter it at /ghost-guard/setup. It is not shown on the setup page. To set your own, run: npx wrangler secret put SETUP_TOKEN`);
       }
-      return htmlResponse(200, renderForm({ generated: tokenInfo.source === 'stored' }));
+      if (config?.complete && url.searchParams.get('rerun') !== '1') {
+        return htmlResponse(200, renderGate({ generated }));
+      }
+      return htmlResponse(200, renderForm({ generated }));
     }
     const form = await readForm(request);
     const provided = String(form.get('setup_token') || '');
@@ -562,7 +558,7 @@ export async function handleSetup(request, env) {
       forgetStoredConfig(env);
       return htmlResponse(200, renderStatus(body.value));
     }
-    const config = await readConfig(env);
+    const config = await readStoredConfig(env);
     const ghostUrl = String(form.get('ghost_url') || '').trim();
     if (intent === 'view' || (!ghostUrl && config?.complete && intent !== 'run')) {
       return htmlResponse(200, renderStatus(config));
@@ -859,7 +855,11 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   })) return { steps, checks: [], secrets, values, ok: false };
 
   const checks = await runChecks(ctx);
-  let config = { ...persisted(), complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
+  // A widget stays (or becomes) activatable only while Turnstile accepts its
+  // secret; a rerun with a rejected secret drops back to waiting.
+  const saved = persisted();
+  const turnstileVerified = checks.some((check) => check.title === TURNSTILE_CHECK && check.ok);
+  let config = { ...saved, turnstileVerified, turnstileEnabled: saved.turnstileEnabled && turnstileVerified, complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
   if (!await run('Save configuration', async () => {
     config = await writeConfig(env, config, previous?.revision || '');
     return 'Settings are saved in this Worker’s setup store. Install the Ghost snippet, then activate signup protection.';

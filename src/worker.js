@@ -71,7 +71,7 @@ async function handleRequest(request, env) {
   }
 
   if (url.pathname === '/signup-shield/webhooks/member-added') {
-    return handleMemberAddedWebhook(request, await config());
+    return handleMemberAddedWebhook(request, await withStoredConfig(env, { fresh: true }));
   }
 
   if (path.endsWith('/members') && url.searchParams.has('token')) {

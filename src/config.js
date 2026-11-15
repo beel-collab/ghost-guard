@@ -29,9 +29,13 @@ export function mergeConfig(env, stored) {
   return next;
 }
 
+export function storeStub(env) {
+  if (!env.SETUP_STORE) return null;
+  return env.SETUP_STORE.get(env.SETUP_STORE.idFromName('setup'));
+}
+
 export async function readStoredConfig(env) {
-  const stub = env.SETUP_STORE.get(env.SETUP_STORE.idFromName('setup'));
-  const res = await stub.fetch(new Request('https://setup-store/config'));
+  const res = await storeStub(env).fetch(new Request('https://setup-store/config'));
   if (!res.ok) throw new Error('setup store unavailable');
   return (await res.json())?.value || null;
 }
@@ -40,18 +44,20 @@ export function forgetStoredConfig(env) {
   if (env?.SETUP_STORE) cache.delete(env.SETUP_STORE);
 }
 
-function cachedRead(env) {
+// Only settled values are cached. Sharing an in-flight read would tie other
+// requests to the I/O of the request that started it, which may be cancelled.
+// Failures are not cached: the next request retries the store.
+async function cachedRead(env) {
   const key = env.SETUP_STORE;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CONFIG_CACHE_MS) return hit.read;
-  const read = readStoredConfig(env);
-  cache.set(key, { at: Date.now(), read });
-  // Failures are not cached: the next request retries the store.
-  read.catch(() => { if (cache.get(key)?.read === read) cache.delete(key); });
-  return read;
+  if (hit && Date.now() - hit.at < CONFIG_CACHE_MS) return hit.value;
+  const value = await readStoredConfig(env);
+  cache.set(key, { at: Date.now(), value });
+  return value;
 }
 
-/** `fresh: true` skips the isolate copy (alarms that must see the latest save). */
+/** `fresh: true` skips the isolate copy: webhooks (Ghost never retries one that
+ * a stale secret rejected) and alarms must see the latest save. */
 export async function withStoredConfig(env, { fresh = false } = {}) {
   if (!env?.SETUP_STORE) return env;
   try {

@@ -145,7 +145,7 @@ function install(t, state) {
     }
     if (url.hostname === 'challenges.cloudflare.com') {
       assert.equal(new URLSearchParams(bodyText).get('secret'), TURNSTILE_SECRET);
-      return json({ success: false, 'error-codes': ['invalid-input-response'] });
+      return json({ success: false, 'error-codes': [state.turnstileRejects ? 'invalid-input-secret' : 'invalid-input-response'] });
     }
     if (url.hostname === 'example.com' && url.pathname === '/ghost-guard/turnstile.js') {
       assert.equal(headers.get('authorization'), null);
@@ -705,8 +705,7 @@ test('activation is refused when the last run could not confirm the Turnstile wi
   install(t, state);
   const store = memoryStore(), env = baseEnv(store);
   await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  const config = store.data.get('config');
-  config.checklist = config.checklist.map((item) => item.title === 'Turnstile widget' ? { ...item, ok: false } : item);
+  store.data.get('config').turnstileVerified = false;
   const refused = await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
   assert.equal(refused.status, 400);
   assert.match(await refused.text(), /could not confirm the Turnstile widget/);
@@ -742,4 +741,51 @@ test('signups reuse this isolate’s copy of stored settings until setup saves',
   // Activation in this isolate takes effect on the next signup, not after the cache expires.
   await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
   assert.equal((await worker.fetch(signup(), env)).status, 400);
+});
+
+test('a rerun whose Turnstile check fails drops an active widget back to waiting', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+  state.turnstileRejects = true;
+  const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
+  assert.equal(store.data.get('config').turnstileEnabled, false);
+  assert.equal(store.data.get('config').turnstileVerified, false);
+  assert.match(rerun, /could not confirm the Turnstile widget secret/);
+  assert.doesNotMatch(rerun, /Activate signup protection/);
+});
+
+test('a generated token is not logged for POSTs or once setup is complete', async (t) => {
+  const state = world();
+  install(t, state);
+  const logs = [];
+  t.mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+  const store = memoryStore(), env = baseEnv(store, { SETUP_TOKEN: '' });
+  await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env);
+  assert.equal(logs.length, 1);
+  const token = logs[0].match(/Setup token: ([a-f0-9]{64})/)[1];
+  await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'run' }, { token: 'wrong' }), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields, { token }), env);
+  assert.equal(store.data.get('config').complete, true);
+  await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env);
+  assert.equal(logs.length, 1);
+});
+
+test('a failed stored-config read is retried on the next request, not cached', async (t) => {
+  let fail = true;
+  const env = {
+    SETUP_STORE: { idFromName(n) { return n; }, get() { return { fetch() {
+      if (fail) throw Error('unavailable');
+      return Response.json({ value: { hostname: 'example.com' } });
+    } }; } },
+    LOCAL_RATE_LIMITER: new MemoryRateLimiter(),
+  };
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response('origin', { status: 201 }));
+  assert.equal((await worker.fetch(signup(), env)).status, 503);
+  fail = false;
+  assert.equal((await worker.fetch(signup(), env)).status, 201);
 });
