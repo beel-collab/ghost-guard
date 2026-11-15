@@ -139,9 +139,12 @@ export async function handleMemberAddedWebhook(request, env) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
-  const raw = await request.text();
   // Signature first. Missing-config details (URL shape, key form) are only
   // returned after a valid signature, so an unsigned caller cannot probe them.
+  // A labeller that is switched off answers exactly like a bad signature.
+  if (!env.WEBHOOK_SECRET && env.CLEANUP_ENABLED !== 'true') {
+    return json({ ok: false, error: 'invalid signature' }, 401);
+  }
   if (!env.WEBHOOK_SECRET) {
     if (!warnedWebhookSecret) {
       warnedWebhookSecret = true;
@@ -149,6 +152,7 @@ export async function handleMemberAddedWebhook(request, env) {
     }
     return json({ ok: false, error: 'unauthorized' }, 503);
   }
+  const raw = await request.text();
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
   if (!valid) {
     return json({ ok: false, error: 'invalid signature' }, 401);

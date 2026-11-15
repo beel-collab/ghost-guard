@@ -138,7 +138,7 @@ export function sanitizeConfig(input) {
     adminApiKey: webhookEnabled ? String(source.adminApiKey || '').slice(0, 128) : '',
     cleanupEnabled: webhookEnabled ? 'true' : 'false',
     labellerDisabled: !webhookEnabled && source.labellerDisabled === true,
-    scriptName: String(source.scriptName || 'ghost-guard').slice(0, 64),
+    scriptName: String(source.scriptName || '').slice(0, 64),
     checklist: sanitizeChecklist(source.checklist),
     updatedAt: Date.now(),
   };
@@ -321,13 +321,16 @@ async function digest(value) {
 
 // On a custom hostname the request says nothing about the script name, so a
 // rerun there reuses the name saved by the first (workers.dev) run.
-export function scriptNameFrom(request, env, stored) {
+export function scriptNameFrom(request, env, stored, { preferRoute = false } = {}) {
   const valid = (name) => /^[a-z0-9][a-z0-9-]{0,62}$/i.test(name);
   const configured = String(env.SCRIPT_NAME || '').trim();
   if (valid(configured)) return configured;
   const host = new URL(request.url).hostname.toLowerCase();
   const match = host.match(/^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/);
   if (match) return match[1];
+  // On the public hostname the route step finds the Worker from the route
+  // this request came through, which beats a possibly stale saved name.
+  if (preferRoute) return '';
   const saved = String(stored?.scriptName || '');
   return valid(saved) ? saved : '';
 }
@@ -475,7 +478,7 @@ function renderGhostSteps(config) {
   const hook = config.webhookEnabled ? `<h2>Optional webhook labeller</h2>
     <p>In Ghost Admin → Settings → Advanced → Integrations, open the custom integration for the key you supplied. Add a <strong>Member added</strong> webhook with this target:</p>
     <pre>${escapeHtml(`https://${config.hostname}/signup-shield/webhooks/member-added`)}</pre>
-    <p>Use the same webhook secret you entered in this form. Keep an existing matching webhook and update its secret if needed. Check its delivery status in Ghost Admin after a test signup.</p>` : '';
+    <p>Use the webhook secret saved with the labeller (the one entered when it was last enabled). Keep an existing matching webhook and update its secret if needed. Check its delivery status in Ghost Admin after a test signup.</p>` : '';
   return `<h2>Install the Ghost snippet</h2>
     <p>In Ghost Admin → Settings → Advanced → Code injection → Site Header, paste this block and save. Replace any earlier ghost-guard block; keep your other header HTML.</p>
     <pre>${escapeHtml(codeInjectionSnippet(config.turnstileSitekey))}</pre>
@@ -596,7 +599,7 @@ export async function handleSetup(request, env) {
       ghost_url: ghostUrl,
       account_id: String(form.get('account_id') || '').trim(),
       ghost_base_path: String(form.get('ghost_base_path') || '').trim(),
-      webhook: String(form.get('webhook') || 'keep'),
+      webhook: ['on', 'off'].includes(form.get('webhook')) ? form.get('webhook') : 'keep',
       webhook_secret: String(form.get('webhook_secret') || ''),
     };
     const cfToken = String(form.get('cf_api_token') || '');
@@ -650,7 +653,7 @@ function adminApiUrlFor(env, site) {
   try {
     return `${new URL(env.GHOST_ORIGIN).origin}${site.ghostBasePath}`;
   } catch {
-    throw httpError('Fix: GHOST_ORIGIN must be an https URL such as https://origin.example.com.', 400);
+    throw httpError('Fix: GHOST_ORIGIN must be a full URL such as https://origin.example.com.', 400);
   }
 }
 
@@ -758,9 +761,9 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   if (labeller) secrets.push(labeller.key, labeller.key.split(':')[1], labeller.secret);
   const ctx = {
     ...site,
-    adminApiUrl: adminApiUrlFor(env, site),
+    adminApiUrl: labeller ? adminApiUrlFor(env, site) : '',
     env,
-    scriptName: scriptNameFrom(request, env, previous),
+    scriptName: scriptNameFrom(request, env, previous, { preferRoute: new URL(request.url).hostname.toLowerCase() === site.hostname }),
     accountId: values.account_id.toLowerCase(),
     webhookEnabled: labeller !== null,
     labellerDisabled: values.webhook === 'off' || (values.webhook === 'keep' && previous?.labellerDisabled === true),
@@ -814,6 +817,7 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
     if (!ctx.scriptName) {
       // This page loaded on that hostname, so a route there runs this Worker.
       const scripts = new Set(ctx.requestHost === ctx.hostname ? routesServingSetup(routes, ctx.hostname).map((route) => route.script).filter(Boolean) : []);
+      if (!scripts.size && /^[a-z0-9][a-z0-9-]{0,62}$/i.test(String(previous?.scriptName || ''))) scripts.add(previous.scriptName);
       if (scripts.size !== 1) throw httpError('Fix: the Worker name is unknown here. Open setup on the Worker’s workers.dev URL, or set the SCRIPT_NAME variable to the Worker name, then run setup again.', 400);
       ctx.scriptName = [...scripts][0];
     }

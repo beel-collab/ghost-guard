@@ -499,6 +499,17 @@ test('first setup on a custom hostname adopts the Worker its route runs, or stop
   assert.equal(state.routePosts, 0);
 });
 
+test('a rerun on the public hostname trusts the route over a stale saved Worker name', async (t) => {
+  const state = world();
+  state.routes.push({ id: 'route-1', pattern: 'example.com/*', script: 'my-guard' });
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  store.data.set('config', { scriptName: 'ghost-guard' });
+  const r = formRequest('/ghost-guard/setup', happyFields);
+  assert.match(await (await worker.fetch(new Request(r.url.replace('ghost-guard.tester.workers.dev', 'example.com'), r), env)).text(), /Cloudflare ready/);
+  assert.equal(store.data.get('config').scriptName, 'my-guard');
+});
+
 test('same-host checks use the subfolder entered in this run, not the saved one', async (t) => {
   const state = world();
   install(t, state);

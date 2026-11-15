@@ -221,8 +221,12 @@ test('unsigned requests cannot tell whether the labeller is switched on', async 
   const unsigned = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
   const on = await worker.fetch(unsigned(), env);
   const off = await worker.fetch(unsigned(), { ...env, CLEANUP_ENABLED: 'false' });
-  assert.equal(off.status, on.status);
-  assert.deepEqual(await off.json(), await on.json());
+  const offViaSetup = await worker.fetch(unsigned(), { ...env, CLEANUP_ENABLED: 'false', WEBHOOK_SECRET: '' });
+  const onBody = await on.json();
+  for (const response of [off, offViaSetup]) {
+    assert.equal(response.status, on.status);
+    assert.deepEqual(await response.json(), onBody);
+  }
 });
 
 test('unsigned requests learn nothing about the Admin API configuration', async (t) => {
