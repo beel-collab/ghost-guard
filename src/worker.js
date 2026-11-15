@@ -22,48 +22,63 @@ const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = canonicalPath(url.pathname);
-    if (path === '/ghost-guard/setup') return handleSetup(request, env);
-    env = await withStoredConfig(env);
-    // Outside a subfolder install the path belongs to whatever else serves this
-    // hostname, so it goes to the zone's normal origin, not to Ghost. The
-    // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
-    // requests use the same rule, so a lookalike path on a root app still
-    // reaches that app after the checks.
-    const forward = env.SIDECAR === true || insideGhost(path, env)
-      ? (forwarded) => forwardToOrigin(forwarded, env)
-      : (forwarded) => forwardToZone(forwarded);
-
-    if (path === '/ghost-guard/turnstile.js') {
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
-      }
-      const assetUrl = new URL(request.url);
-      assetUrl.pathname = '/ghost-guard/turnstile.js';
-      return env.ASSETS.fetch(new Request(assetUrl, { method: request.method, headers: request.headers }));
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      if (error.code !== 'SETUP_CONFIG_UNAVAILABLE') throw error;
+      return portalError('Signup protection is temporarily unavailable. Please try again later.', 503);
     }
-
-    // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
-    // serves these under <subfolder>/members, and covering a lookalike path
-    // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
-    if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
-      return handleSendMagicLink(request, env, forward);
-    }
-
-    if (url.pathname === '/signup-shield/webhooks/member-added') {
-      return handleMemberAddedWebhook(request, env);
-    }
-
-    if (path.endsWith('/members') && url.searchParams.has('token')) {
-      return handleMagicLink(request, url, env, forward);
-    }
-
-    return forward(request);
   },
 };
 
-async function handleSendMagicLink(request, env, forward) {
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+  const path = canonicalPath(url.pathname);
+  if (path === '/ghost-guard/setup') return handleSetup(request, env);
+  // Read once per protected request. Ordinary same-zone pages and assets
+  // don't need setup settings. Direct-origin routing does need the base path.
+  let configPromise;
+  const config = () => configPromise ||= withStoredConfig(env);
+  // Outside a subfolder install the path belongs to whatever else serves this
+  // hostname, so it goes to the zone's normal origin, not to Ghost. The
+  // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
+  // requests use the same rule, so a lookalike path on a root app still
+  // reaches that app after the checks.
+  const forward = async (forwarded) => {
+    const routingEnv = env.GHOST_ORIGIN && env.SETUP_STORE ? await config() : env;
+    return routingEnv.SIDECAR === true || insideGhost(path, routingEnv)
+      ? forwardToOrigin(forwarded, routingEnv)
+      : forwardToZone(forwarded);
+  };
+
+  if (path === '/ghost-guard/turnstile.js') {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+    }
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = '/ghost-guard/turnstile.js';
+    return env.ASSETS.fetch(new Request(assetUrl, { method: request.method, headers: request.headers }));
+  }
+
+  // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
+  // serves these under <subfolder>/members, and covering a lookalike path
+  // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
+  if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
+    return handleSendMagicLink(request, config, forward);
+  }
+
+  if (url.pathname === '/signup-shield/webhooks/member-added') {
+    return handleMemberAddedWebhook(request, await config());
+  }
+
+  if (path.endsWith('/members') && url.searchParams.has('token')) {
+    return handleMagicLink(request, url, env, forward);
+  }
+
+  return forward(request);
+}
+
+async function handleSendMagicLink(request, config, forward) {
   let body;
   try {
     body = await request.clone().json();
@@ -80,6 +95,8 @@ async function handleSendMagicLink(request, env, forward) {
   if (typeof body.email !== 'string' || !body.email.trim()) {
     return portalError('Please enter an email address.', 400);
   }
+
+  const env = await config();
 
   // Bound verification traffic even when every challenge is missing or invalid.
   const ipError = await rateLimitRejection(checkSignupIpRateLimit(request, env));

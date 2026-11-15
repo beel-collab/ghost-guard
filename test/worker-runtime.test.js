@@ -142,19 +142,38 @@ test('Wrangler runtime retries a failed webhook labelling from the Durable Objec
     import { RETRY_DELAYS_MS } from ${JSON.stringify(fileURLToPath(new URL('webhook.js', src)))};
     RETRY_DELAYS_MS.splice(0, RETRY_DELAYS_MS.length, 200, 200);
     export { SignupRateLimiter, MemberLabeller, SetupStore };
-    export default worker;
+    export default {
+      fetch(request, env) {
+        if (new URL(request.url).pathname === '/__test/config') {
+          const store = env.SETUP_STORE.get(env.SETUP_STORE.idFromName('setup'));
+          return store.fetch('https://setup-store/config', {method:'PUT',body:request.body});
+        }
+        return worker.fetch(request, env);
+      },
+    };
   `);
   const adminUrl = `http://127.0.0.1:${origin.address().port}`;
   const dev = await unstable_dev(entry, {
     config: 'wrangler.toml', ip: '127.0.0.1', port: 0, inspectorPort: 0,
     local: true, persist: false, logLevel: 'error',
     vars: {
-      GHOST_ORIGIN: adminUrl, CLEANUP_ENABLED: 'true', ADMIN_API_URL: adminUrl,
-      ADMIN_API_KEY: 'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4), WEBHOOK_SECRET: 'webhook-secret',
+      GHOST_ORIGIN: adminUrl, CLEANUP_ENABLED: 'false', ADMIN_API_URL: '',
     },
     experimental: { disableExperimentalWarning: true, disableDevRegistry: true, watch: false },
   });
   t.after(() => dev.stop());
+
+  // SetupStore is the only source of labeller credentials, including in the
+  // separately constructed Durable Object that performs background retries.
+  const seeded = await dev.fetch('/__test/config', {
+    method:'PUT', headers:{'content-type':'application/json'},
+    body:JSON.stringify({value:{
+      webhookEnabled:true, adminApiUrl:adminUrl,
+      adminApiKey:'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4),
+      webhookSecret:'webhook-secret',
+    }}),
+  });
+  assert.equal(seeded.status,200);
 
   const body = JSON.stringify({ member: { current: { id: memberId, email: 'reader@work.example' } } });
   const timestamp = String(Date.now());

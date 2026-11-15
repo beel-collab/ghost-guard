@@ -1,4 +1,5 @@
 /** Authenticated, additive member labelling shared by Worker and sidecar. */
+import { withStoredConfig } from './setup.js';
 const REVIEW_LABEL = 'signup-shield-review';
 
 // Ghost sends each webhook once: a POST with a 2 s timeout that is not retried.
@@ -106,7 +107,10 @@ export class MemberLabeller {
     const id = await this.storage.get('id');
     if (!id) return;
     try {
-      await labelCurrentMember(this.env, id);
+      // Durable Objects receive deployment env, independently of Worker.fetch.
+      // Reload setup settings on each attempt so retries see corrected config.
+      const env = await withStoredConfig(this.env);
+      if (env.CLEANUP_ENABLED === 'true') await labelCurrentMember(env, id);
       // A delivery that arrived mid-run has scheduled another pass; keep its state.
       if ((await this.storage.getAlarm()) === null) await this.storage.deleteAll();
     } catch (error) {

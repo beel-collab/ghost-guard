@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
 import {
-  SetupStore, SETUP_FAILURE_LIMIT, mergeCodeInjection, mergeConfig, GUARD_START, GUARD_END,
+  SetupStore, SETUP_FAILURE_LIMIT, codeInjectionSnippet, mergeConfig, GUARD_START, GUARD_END,
 } from '../src/setup.js';
 
 const ZONE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -64,24 +64,20 @@ const happyFields = {
   admin_api_key: ADMIN_KEY,
   cf_api_token: CF_TOKEN,
   webhook: 'on',
+  webhook_secret: 'chosen-webhook-secret-SENTINEL',
 };
 
 function world() {
   const state = {
-    head: '<!-- keep-before --><script>analytics</script><!-- keep-after -->',
     routes: [],
     widgets: [],
-    webhooks: [],
-    secrets: [],
     calls: [],
     failWidgets: false,
-    failSecrets: false,
     scriptStatus: 200,
     scriptBody: 'window.__ghostGuardTurnstile = true;',
-    webhookRejectIntegration: false,
+    signinStatus: 201,
     routePosts: 0,
     widgetPosts: 0,
-    webhookPosts: 0,
   };
   return state;
 }
@@ -129,38 +125,7 @@ function install(t, state) {
         const widget = state.widgets.find((item) => item.sitekey === decodeURIComponent(widgetGet[1]));
         return json({ success: true, result: widget });
       }
-      if (url.pathname.endsWith('/secrets') && method === 'PUT') {
-        if (state.failSecrets) return json({ success: false, errors: [{ message: 'Workers Scripts edit was denied' }] }, 403);
-        const secret = JSON.parse(bodyText);
-        state.secrets.push(secret);
-        return json({ success: true, result: { name: secret.name, type: secret.type } });
-      }
       throw new Error(`Unexpected Cloudflare call ${method} ${url.pathname}`);
-    }
-    if (url.hostname === 'example.com' && url.pathname.endsWith('/ghost/api/admin/settings/')) {
-      assert.match(headers.get('authorization') || '', /^Ghost /);
-      if (method === 'GET') return json({ settings: [{ key: 'codeinjection_head', value: state.head }, { key: 'title', value: 'Example' }] });
-      const parsed = JSON.parse(bodyText);
-      assert.deepEqual(parsed.settings.map((item) => item.key), ['codeinjection_head']);
-      state.head = parsed.settings[0].value;
-      return json({ settings: parsed.settings });
-    }
-    if (url.hostname === 'example.com' && url.pathname.includes('/ghost/api/admin/webhooks')) {
-      assert.match(headers.get('authorization') || '', /^Ghost /);
-      if (method === 'GET') return json({ webhooks: state.webhooks, meta: { pagination: { pages: 1 } } });
-      const parsed = JSON.parse(bodyText);
-      const webhook = parsed.webhooks[0];
-      if (method === 'POST' && state.webhookRejectIntegration && webhook.integration_id) {
-        state.webhookPosts += 1;
-        return json({ errors: [{ message: 'Validation error' }] }, 422);
-      }
-      if (method === 'POST') {
-        state.webhookPosts += 1;
-        const saved = { id: 'webhook-1', ...webhook };
-        state.webhooks.push(saved);
-        return json({ webhooks: [saved] }, 201);
-      }
-      throw new Error(`Unexpected webhook ${method}`);
     }
     if (url.hostname === 'challenges.cloudflare.com') {
       assert.equal(new URLSearchParams(bodyText).get('secret'), TURNSTILE_SECRET);
@@ -181,14 +146,14 @@ function install(t, state) {
       const payload = JSON.parse(bodyText);
       assert.equal(payload.emailType, 'signin');
       assert.equal(payload.email, 'ghost-guard-setup-check@example.invalid');
-      return json({ success: true }, 201);
+      return json({ success: true }, state.signinStatus);
     }
     throw new Error(`Unexpected fetch ${method} ${url.href}`);
   });
 }
 
 function assertNoSecrets(html, extra = []) {
-  for (const secret of [SETUP_TOKEN, CF_TOKEN, ADMIN_KEY, ADMIN_SECRET, TURNSTILE_SECRET, ...extra]) {
+  for (const secret of [SETUP_TOKEN, CF_TOKEN, ADMIN_KEY, ADMIN_SECRET, TURNSTILE_SECRET, happyFields.webhook_secret, ...extra]) {
     assert.equal(html.includes(secret), false, secret);
   }
 }
@@ -235,222 +200,168 @@ test('a generated setup token is logged once and never written into the page', a
   assert.equal(logs.length, 1);
 });
 
-test('setup performs each step, and a re-run reuses routes, widgets and webhooks', async (t) => {
+
+test('setup prepares Cloudflare without Ghost writes or Worker secret deployments, then activates explicitly', async (t) => {
   const state = world();
   install(t, state);
   const store = memoryStore();
   const env = baseEnv(store);
-  const first = await worker.fetch(formRequest('/Ghost-Guard//Setup/', happyFields), env);
-  assert.equal(first.status, 200);
-  const html = await first.text();
-  assert.match(html, /Setup complete/);
-  for (const title of ['Cloudflare zone', 'Worker route', 'Turnstile widget', 'Ghost code injection', 'Save configuration', 'Webhook labeller', 'Route reachable', 'Turnstile widget', 'Code injection snippet', 'Confirmation page', 'Sign-in passthrough', 'Webhook']) {
-    assert.match(html, new RegExp(title));
-  }
-  assert.match(html, /OK/);
+  const response = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const html = await response.text();
+  assert.match(html, /Cloudflare ready/);
+  assert.match(html, /Install the Ghost snippet/);
+  assert.match(html, /Activate signup protection/);
+  assert.match(html, /Member added/);
+  assert.match(html, /https:\/\/example.com\/signup-shield\/webhooks\/member-added/);
+  assert.match(html, /data-sitekey=&quot;0x4AAAAAABBBBBCCCCCDDDDD&quot;/);
   assertNoSecrets(html);
-  assert.equal(state.routePosts, 1);
-  assert.equal(state.widgetPosts, 1);
-  assert.equal(state.webhookPosts, 1);
-  assert.equal(state.routes[0].pattern, 'example.com/*');
-  assert.equal(state.routes[0].script, 'ghost-guard');
-  assert.equal(state.widgets[0].name, 'ghost-guard-example.com');
-  assert.deepEqual(state.widgets[0].domains, ['example.com']);
-  assert.equal(state.webhooks[0].event, 'member.added');
-  assert.equal(state.webhooks[0].target_url, 'https://example.com/signup-shield/webhooks/member-added');
-  assert.equal(state.webhooks[0].integration_id, ADMIN_ID);
-  assert.equal((state.head.match(/ghost-guard:start/g) || []).length, 1);
-  assert.match(state.head, /keep-before/);
-  assert.match(state.head, /<script>analytics<\/script>/);
-  assert.match(state.head, /keep-after/);
-  assert.match(state.head, new RegExp(`data-sitekey="${SITEKEY}"`));
-  assert.deepEqual(state.secrets.map((secret) => secret.name).sort(), ['ADMIN_API_KEY', 'TURNSTILE_SECRET', 'WEBHOOK_SECRET']);
-  const saved = store.data.get('config');
-  assert.equal(saved.complete, true);
-  assert.equal(saved.turnstileSecret, TURNSTILE_SECRET);
-  assert.equal(saved.adminApiKey, ADMIN_KEY);
-  assert.equal(saved.webhookSecret, state.webhooks[0].secret);
-  assert.equal(saved.ghostBasePath, '/blog');
-  assert.equal(saved.cleanupEnabled, 'true');
+  assert.equal(store.data.get('config').turnstileEnabled, false);
+  assert.equal(store.data.get('config').adminApiKey, ADMIN_KEY);
+  assert.equal(store.data.get('config').webhookSecret, happyFields.webhook_secret);
+  assert.equal(state.calls.some(call => call.url.pathname.includes('/ghost/api/admin/')), false);
+  assert.equal(state.calls.some(call => call.url.pathname.endsWith('/secrets')), false);
   assert.equal(JSON.stringify([...store.data.values()]).includes(CF_TOKEN), false);
-  assertNoSecrets(html, [saved.webhookSecret]);
 
-  const secretPuts = state.secrets.length;
-  const second = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  assert.equal(second.status, 200);
-  assert.match(await second.text(), /Setup complete/);
+  const missingCheckbox = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'activate'}), env);
+  assert.equal(missingCheckbox.status, 400);
+  const unauthorized = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'activate',snippet_installed:'on'}, {token:'wrong'}), env);
+  assert.equal(unauthorized.status, 401);
+  assert.equal(store.data.get('config').turnstileEnabled, false);
+  const activated = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'activate',snippet_installed:'on'}), env);
+  assert.match(await activated.text(), /Turnstile signup protection is active/);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+  const blocked = await worker.fetch(signup(), env);
+  assert.equal(blocked.status, 400);
+
+  const rerun = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  assert.match(await rerun.text(), /Turnstile signup protection is active/);
   assert.equal(state.routePosts, 1);
   assert.equal(state.widgetPosts, 1);
-  assert.equal(state.webhookPosts, 1);
-  assert.equal(state.routes.length, 1);
-  assert.equal(state.widgets.length, 1);
-  assert.equal(state.webhooks.length, 1);
-  assert.equal((state.head.match(/ghost-guard:start/g) || []).length, 1);
-  assert.match(state.head, /analytics/);
-  assert.equal(state.secrets.length, secretPuts * 2);
-  assert.equal(state.calls.filter((call) => call.url.pathname.includes('/ghost/api/admin/members')).length, 0);
-
   const gate = await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env);
   const gateHtml = await gate.text();
-  assert.match(gateHtml, /already complete/);
-  assert.doesNotMatch(gateHtml, /Route reachable|admin_api_key|cf_api_token/);
-  assertNoSecrets(gateHtml, [saved.webhookSecret]);
-  const status = await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'view' }), env);
-  const statusHtml = await status.text();
-  assert.match(statusHtml, /Route reachable/);
-  assertNoSecrets(statusHtml, [saved.webhookSecret]);
+  assert.doesNotMatch(gateHtml, /data-sitekey|Route reachable/);
+  const status = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'view'}), env);
+  assert.match(await status.text(), /Install the Ghost snippet/);
 });
 
-test('webhook creation retries without an integration id, and a disabled labeller stores no admin key', async (t) => {
+test('signup-only setup needs no Ghost credentials; disabling the labeller clears its stored credentials', async (t) => {
   const state = world();
-  state.webhookRejectIntegration = true;
   install(t, state);
   const store = memoryStore();
-  const created = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
-  assert.match(await created.text(), /Setup complete/);
-  assert.equal(state.webhookPosts, 2);
-  assert.equal(state.webhooks.length, 1);
-  assert.equal(state.webhooks[0].integration_id, undefined);
-  const off = world();
-  install(t, off);
-  const offStore = memoryStore();
-  const { webhook, ...fields } = happyFields;
-  void webhook;
-  const response = await worker.fetch(formRequest('/ghost-guard/setup', fields), baseEnv(offStore));
-  assert.match(await response.text(), /Webhook labeller is off/);
-  assert.equal(off.webhookPosts, 0);
-  assert.equal(offStore.data.get('config').adminApiKey, '');
-  assert.equal(offStore.data.get('config').webhookSecret, '');
-  assert.equal(off.secrets.map((secret) => secret.name).includes('ADMIN_API_KEY'), false);
+  const env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const {webhook, webhook_secret, admin_api_key, ...fields} = happyFields;
+  const response = await worker.fetch(formRequest('/ghost-guard/setup', fields), env);
+  assert.match(await response.text(), /Cloudflare ready/);
+  const saved = store.data.get('config');
+  assert.equal(saved.cleanupEnabled, 'false');
+  assert.equal(saved.adminApiKey, '');
+  assert.equal(saved.webhookSecret, '');
+  const effective = mergeConfig({CLEANUP_ENABLED:'true',ADMIN_API_KEY:ADMIN_KEY}, saved);
+  assert.equal(effective.CLEANUP_ENABLED, 'false');
+  assert.equal(effective.ADMIN_API_KEY, '');
 });
 
-test('a failed Turnstile step reports that step and keeps the route for a later re-run', async (t) => {
+test('a failed widget step keeps the previous working configuration and can be retried', async (t) => {
   const state = world();
   state.failWidgets = true;
   install(t, state);
   const store = memoryStore();
-  const env = baseEnv(store);
-  const failed = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const previous = {turnstileSecret:'previous-secret',turnstileEnabled:true,cleanupEnabled:'true',adminApiUrl:'https://old.example'};
+  store.data.set('config', previous);
+  const failed = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
   const html = await failed.text();
   assert.match(html, /Setup did not finish/);
-  assert.match(html, /Turnstile widget/);
-  assert.match(html, /Needs attention/);
   assert.match(html, /Turnstile permission was denied/);
-  assert.match(html, /Worker route/);
+  assert.match(html, /Zone Zone Read/);
   assertNoSecrets(html);
-  assert.equal(state.routePosts, 1);
-  assert.equal(state.widgetPosts, 0);
-  assert.equal(state.head.includes('ghost-guard:start'), false);
-  assert.equal(store.data.get('config'), undefined);
+  assert.deepEqual(store.data.get('config'), previous);
   state.failWidgets = false;
-  const again = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  assert.match(await again.text(), /Setup complete/);
+  const success = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
+  assert.match(await success.text(), /Cloudflare ready/);
   assert.equal(state.routePosts, 1);
-  assert.equal(state.widgetPosts, 1);
-  assert.equal(state.routes.length, 1);
 });
 
-test('Worker secret updates are optional when the setup store holds the config', async (t) => {
+test('setup reports unreachable routes and failed sign-in checks without claiming success for them', async (t) => {
   const state = world();
-  state.failSecrets = true;
+  state.scriptStatus = 404;
+  state.scriptBody = 'Not found';
+  state.signinStatus = 503;
   install(t, state);
   const store = memoryStore();
-  const response = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
-  const html = await response.text();
-  assert.match(html, /Setup complete/);
-  assert.match(html, /Workers Scripts edit was denied/);
-  assert.equal(store.data.get('config').turnstileSecret, TURNSTILE_SECRET);
-  assertNoSecrets(html, [store.data.get('config').webhookSecret]);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
+  const checks = store.data.get('config').checklist;
+  assert.equal(checks.find(check => check.title === 'Route reachable').ok, false);
+  const signin = checks.find(check => check.title === 'Sign-in passthrough');
+  assert.equal(signin.ok, false);
+  assert.match(signin.detail, /HTTP 503/);
 });
 
-test('route check is red from workers.dev when the script is not served, and green on the site itself', async (t) => {
-  const missed = world();
-  missed.scriptStatus = 404;
-  missed.scriptBody = '<html>origin</html>';
-  install(t, missed);
-  const red = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(memoryStore()));
-  const redHtml = await red.text();
-  assert.match(redHtml, /Needs attention[\s\S]*Route reachable|Route reachable[\s\S]*Needs attention/);
-  assert.match(redHtml, /Fix:/);
-  const served = world();
-  served.scriptStatus = 404;
-  served.scriptBody = '<html>origin</html>';
-  install(t, served);
-  const request = new Request('https://example.com/ghost-guard/setup', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', 'CF-Connecting-IP': '192.0.2.10' },
-    body: new URLSearchParams({ ...happyFields, setup_token: SETUP_TOKEN }),
+function signup(emailType = 'signup') {
+  return new Request('https://example.com/members/api/send-magic-link/', {
+    method:'POST',headers:{'content-type':'application/json','CF-Connecting-IP':'192.0.2.10'},
+    body:JSON.stringify({email:'reader@work.example',emailType}),
   });
-  const green = await worker.fetch(request, baseEnv(memoryStore()));
-  const greenHtml = await green.text();
-  assert.match(greenHtml, /skips the Worker/);
-  assert.match(greenHtml, /Route reachable/);
-  assert.doesNotMatch(greenHtml.split('Route reachable')[1].slice(0, 220), /Needs attention/);
+}
+
+test('stored config outages reject signup and webhook traffic; ordinary same-zone traffic and assets keep working', async (t) => {
+  let reads = 0;
+  const env = {
+    SETUP_STORE:{idFromName(n){return n;},get(){return {fetch(){reads++;throw Error('unavailable');}};}},
+    LOCAL_RATE_LIMITER:new MemoryRateLimiter(),
+    ASSETS:{fetch(){return new Response('script');}},
+  };
+  const forwarded = [];
+  t.mock.method(globalThis,'fetch',async request=>{forwarded.push(request.url);return new Response('origin',{status:201});});
+  assert.equal((await worker.fetch(signup(),env)).status,503);
+  assert.equal((await worker.fetch(new Request('https://example.com/signup-shield/webhooks/member-added',{method:'POST',body:'{}'}),env)).status,503);
+  assert.equal(forwarded.length,0);
+  const before = reads;
+  for (const path of ['/', '/post/', '/image.png', '/members/?token=x&action=signup']) {
+    assert.ok((await worker.fetch(new Request(`https://example.com${path}`),env)).ok);
+  }
+  assert.equal((await worker.fetch(new Request('https://example.com/ghost-guard/turnstile.js'),env)).status,200);
+  assert.equal((await worker.fetch(signup('signin'),env)).status,201);
+  assert.equal(reads,before);
 });
 
-test('stored config fills unset settings and environment values win', async (t) => {
-  const calls = [];
-  t.mock.method(globalThis, 'fetch', async (input, init) => {
-    const request = input instanceof Request ? input : new Request(input, init);
-    if (String(request.url) === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
-      calls.push({ kind: 'verify', secret: new URLSearchParams(init.body).get('secret') });
-      return Response.json({ success: true, hostname: 'blog.example', action: 'ghost_signup' });
-    }
-    calls.push({ kind: 'forward', host: new URL(request.url).host, pathname: new URL(request.url).pathname });
-    return Response.json({ ok: true }, { status: 201 });
+test('stored settings own setup-managed fields and preserve manual deployments without config', async (t) => {
+  const manual = {TURNSTILE_SECRET:'manual',CLEANUP_ENABLED:'true'};
+  assert.equal(mergeConfig(manual,null),manual);
+  const effective = mergeConfig({TURNSTILE_SECRET:'stale',GHOST_BASE_PATH:'/old',ADMIN_API_URL:'https://old.example',CLEANUP_ENABLED:'false'}, {
+    turnstileSecret:'stored',ghostBasePath:'/blog',cleanupEnabled:'true',adminApiUrl:'https://example.com/blog',adminApiKey:ADMIN_KEY,webhookSecret:'stored-hook',
   });
+  assert.equal(effective.TURNSTILE_SECRET,'stored');
+  assert.equal(effective.GHOST_BASE_PATH,'/blog');
+  assert.equal(effective.ADMIN_API_URL,'https://example.com/blog');
+  assert.equal(effective.CLEANUP_ENABLED,'true');
+  assert.equal(mergeConfig(manual,{turnstileSecret:'prepared',turnstileEnabled:false}).TURNSTILE_SECRET,'');
   const store = memoryStore();
-  store.data.set('config', { ghostBasePath: '/blog', turnstileSecret: 'stored-secret', cleanupEnabled: 'true', adminApiUrl: 'https://stored.example' });
-  const env = baseEnv(store, { SETUP_TOKEN: 'x', TURNSTILE_SECRET: undefined, GHOST_BASE_PATH: undefined, CLEANUP_ENABLED: 'false', ADMIN_API_URL: '' });
-  const signup = await worker.fetch(new Request('https://blog.example/members/api/send-magic-link/', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'CF-Connecting-IP': '192.0.2.1', 'cf-turnstile-response': 'token' },
-    body: JSON.stringify({ email: 'reader@work.example', emailType: 'signup' }),
-  }), env);
-  assert.equal(signup.status, 201);
-  assert.equal(calls.find((call) => call.kind === 'verify').secret, 'stored-secret');
-  await worker.fetch(new Request('https://blog.example/about/'), env);
-  await worker.fetch(new Request('https://blog.example/blog/post/'), env);
-  assert.deepEqual(calls.filter((call) => call.kind === 'forward' && call.pathname !== '/members/api/send-magic-link/').map((call) => call.host), ['blog.example', 'origin.example']);
-  const override = baseEnv(store, { TURNSTILE_SECRET: 'env-secret', GHOST_BASE_PATH: '/news' });
-  calls.length = 0;
-  await worker.fetch(new Request('https://blog.example/members/api/send-magic-link/', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'CF-Connecting-IP': '192.0.2.2', 'cf-turnstile-response': 'token' },
-    body: JSON.stringify({ email: 'other@work.example', emailType: 'signup' }),
-  }), override);
-  assert.equal(calls.find((call) => call.kind === 'verify').secret, 'env-secret');
-  await worker.fetch(new Request('https://blog.example/blog/post/'), override);
-  await worker.fetch(new Request('https://blog.example/news/post/'), override);
-  assert.deepEqual(calls.filter((call) => call.kind === 'forward' && !call.pathname.endsWith('/send-magic-link/')).map((call) => call.host), ['blog.example', 'origin.example']);
+  store.data.set('config',{ghostBasePath:'/blog'});
+  const hosts = [];
+  t.mock.method(globalThis,'fetch',async request=>{hosts.push(new URL(request.url).hostname);return new Response('ok');});
+  const env = baseEnv(store,{GHOST_BASE_PATH:'/old'});
+  await worker.fetch(new Request('https://example.com/about/'),env);
+  await worker.fetch(new Request('https://example.com/blog/post/'),env);
+  assert.deepEqual(hosts,['example.com','origin.example']);
 });
 
-test('code injection replaces only the marked block', () => {
-  const existing = `before\n${GUARD_START}\nOLD\n${GUARD_END}\nmiddle\n${GUARD_START}\nAGAIN\n${GUARD_END}\nafter`;
-  const merged = mergeCodeInjection(existing, 'sitekey');
-  assert.equal((merged.match(/ghost-guard:start/g) || []).length, 1);
-  assert.match(merged, /before/);
-  assert.match(merged, /middle/);
-  assert.match(merged, /after/);
-  assert.doesNotMatch(merged, /OLD|AGAIN/);
-  assert.match(merged, /data-sitekey="sitekey"/);
-  assert.equal(mergeConfig({ CLEANUP_ENABLED: 'false', ADMIN_API_URL: '', TURNSTILE_SECRET: 'env' }, {
-    cleanupEnabled: 'true', adminApiUrl: 'https://stored.example', turnstileSecret: 'stored',
-  }).TURNSTILE_SECRET, 'env');
+test('manual snippet contains only the public key and rejects unsafe keys', () => {
+  assert.equal(codeInjectionSnippet(SITEKEY), `${GUARD_START}\n<script src="/ghost-guard/turnstile.js" data-sitekey="${SITEKEY}"></script>\n${GUARD_END}`);
+  assert.throws(()=>codeInjectionSnippet('"><script>bad</script>'));
 });
 
-test('bad setup input does not call Cloudflare', async (t) => {
+test('bad setup inputs and activation before preparation call no external APIs', async (t) => {
   const state = world();
-  install(t, state);
+  install(t,state);
   const env = baseEnv(memoryStore());
-  const response = await worker.fetch(formRequest('/ghost-guard/setup', { ...happyFields, ghost_base_path: '/blog/..' }), env);
-  assert.equal(response.status, 400);
-  assert.match(await response.text(), /GHOST_BASE_PATH/);
-  assert.equal(state.calls.length, 0);
-  const type = await worker.fetch(new Request('https://blog.example/ghost-guard/setup', {
-    method: 'POST',
-    headers: { 'content-type': 'text/plain', 'CF-Connecting-IP': '192.0.2.10' },
-    body: 'setup_token=x',
-  }), env);
-  assert.equal(type.status, 400);
+  for (const fields of [
+    {...happyFields,ghost_base_path:'/blog/..'},
+    {...happyFields,admin_api_key:'invalid'},
+    {...happyFields,webhook_secret:'short'},
+    {intent:'activate',snippet_installed:'on'},
+  ]) {
+    assert.equal((await worker.fetch(formRequest('/ghost-guard/setup',fields),env)).status,400);
+  }
+  assert.equal(state.calls.length,0);
 });

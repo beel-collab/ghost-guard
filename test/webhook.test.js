@@ -281,7 +281,8 @@ test('the queue allows different members to proceed independently', async () => 
 
 // Worker delivery: the Durable Object stores the member and labels from its alarm.
 
-function durable() {
+function durable(overrides = {}) {
+  const deploymentEnv = { ...env, ...overrides };
   const data = new Map();
   const storage = {
     data, alarm: null,
@@ -291,15 +292,63 @@ function durable() {
     async getAlarm() { return storage.alarm; },
     async setAlarm(time) { storage.alarm = time; },
   };
-  const object = new MemberLabeller({ storage }, env);
+  const object = new MemberLabeller({ storage }, deploymentEnv);
   // The runtime clears the alarm before invoking the handler.
   const fire = () => { storage.alarm = null; return object.alarm(); };
-  const config = { ...env, MEMBER_LABELLER: {
+  const config = { ...deploymentEnv, MEMBER_LABELLER: {
     idFromName(key) { assert.equal(key, `https://admin.example:${memberId}`); return key; },
     get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
   } };
   return { storage, fire, config };
 }
+
+test('Worker alarms reload stored settings and retry storage outages without calling Ghost', async (t) => {
+  const state = ghost(t);
+  let unavailable = false;
+  const stored = {
+    cleanupEnabled: 'true', adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: env.WEBHOOK_SECRET,
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() {
+      if (unavailable) throw new Error('store outage');
+      return Response.json({ value: stored });
+    } }; },
+  };
+  const { storage, fire, config } = durable({
+    SETUP_STORE, CLEANUP_ENABLED: 'false', ADMIN_API_URL: '', ADMIN_API_KEY: '', WEBHOOK_SECRET: '',
+  });
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  unavailable = true;
+  t.mock.method(console, 'warn', () => {});
+  await fire();
+  assert.equal(state.calls.length, 0);
+  assert.equal(storage.data.get('attempt'), 1);
+  assert.ok(storage.alarm > Date.now());
+  unavailable = false;
+  await fire();
+  assert.equal(state.member.labels.filter(item => item.name === label.name).length, 1);
+  assert.equal(storage.data.size, 0);
+});
+
+test('a pending alarm stops when the labeller is disabled in saved configuration', async (t) => {
+  const state = ghost(t);
+  const saved = {
+    cleanupEnabled:'true', adminApiUrl:env.ADMIN_API_URL,
+    adminApiKey:env.ADMIN_API_KEY, webhookSecret:env.WEBHOOK_SECRET,
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { return Response.json({value:saved}); } }; },
+  };
+  const { storage, fire, config } = durable({SETUP_STORE});
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  saved.cleanupEnabled = 'false';
+  await fire();
+  assert.equal(state.calls.length, 0);
+  assert.equal(storage.data.size, 0);
+});
 
 test('Worker acknowledges at once and labels from the Durable Object alarm', async (t) => {
   const state = ghost(t);

@@ -39,8 +39,8 @@ new_sqlite_classes = ["SetupStore"]
 # Secrets: SETUP_TOKEN, CONFIRM_SECRET, GHOST_ORIGIN, TURNSTILE_SECRET,
 # ADMIN_API_KEY and WEBHOOK_SECRET. Never commit real secrets.
 # SETUP_TOKEN locks /ghost-guard/setup. The Deploy button asks for it
-# (.dev.vars.example). The setup page can create the Turnstile and webhook
-# secrets; it stores a copy in SETUP_STORE when the matching env value is unset.
+# (.dev.vars.example). Guided setup stores its managed settings only in
+# SETUP_STORE; these override the corresponding manual environment settings.
 [vars]
 INTERSTITIAL_ACTIONS = "signup,subscribe,signup-paid"
 SITE_TITLE = "this publication"

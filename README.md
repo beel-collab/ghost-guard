@@ -16,8 +16,10 @@ Ghost has no official plugin system. This is a proxy prototype, not an official 
 Your Ghost hostname must already be proxied by Cloudflare (the orange cloud). Ghost(Pro) cannot sit behind this proxy; use the webhook-only note further down instead.
 
 1. Click **Deploy to Cloudflare** above. When the deploy asks, set `SETUP_TOKEN` to a long random string. That value is the password for the setup page. Leave the Worker name as `ghost-guard`.
-2. Open `https://yourdomain.com/ghost-guard/setup`. The hostname route does not exist yet, so use the `*.workers.dev` URL from the deploy result first, for example `https://ghost-guard.<account>.workers.dev/ghost-guard/setup`. The form attaches `yourdomain.com/*` for you.
-3. Submit the one form: the setup token, the public Ghost URL (`https://yourdomain.com` or `https://yourdomain.com/blog`), the custom integration's Admin API key (`id:secret`), and a Cloudflare API token. A subfolder and the webhook labeller are optional.
+2. Open the setup page on the deploy result’s `*.workers.dev` URL, for example `https://ghost-guard.<account>.workers.dev/ghost-guard/setup`.
+3. Submit the setup token, public Ghost URL (`https://yourdomain.com` or `https://yourdomain.com/blog`), and Cloudflare API token. The form attaches `yourdomain.com/*` and prepares a managed Turnstile widget. Ghost credentials are optional and needed only for the webhook labeller.
+4. Copy the displayed snippet into **Ghost Admin → Settings → Advanced → Code injection → Site Header** and save. Keep other header HTML; replace an earlier ghost-guard block instead of adding a second one.
+5. Return to setup, confirm the snippet is installed, and enter the setup token to **Activate signup protection**. Until activation, quotas and the confirmation page work, and Turnstile stays off. Reload your public site and test signup and sign-in.
 
 From a checkout, set the token yourself and deploy:
 
@@ -38,6 +40,7 @@ Create the token at <https://dash.cloudflare.com/profile/api-tokens> and include
 
 | Scope | Permission |
 | --- | --- |
+| Zone | Zone: Read |
 | Zone | Workers Routes: Edit |
 | Account | Turnstile: Edit |
 | Account | Workers Scripts: Edit |
@@ -46,12 +49,12 @@ The account ID is taken from the zone. Paste one into the form only if discovery
 
 ### What the form changes
 
-- **Cloudflare:** route `<host>/*` on the `ghost-guard` Worker (reused if it already points at this script). A managed Turnstile widget named `ghost-guard-<host>` for that hostname. Worker secrets `TURNSTILE_SECRET` and, when the labeller is on, `WEBHOOK_SECRET` and `ADMIN_API_KEY`.
-- **This Worker:** a `SetupStore` Durable Object holds the runtime copy (Turnstile secret, and the labeller settings when enabled). The Worker reads it when the matching environment value is unset. `ADMIN_API_URL`, `CLEANUP_ENABLED`, and `GHOST_BASE_PATH` are plain vars in `wrangler.toml`, so they cannot be replaced through the secret API without rewriting every binding; they live in the Durable Object. A non-empty environment variable still wins, except `CLEANUP_ENABLED`, which wins only when it is exactly `true` (the file ships `"false"`). Leave `ADMIN_API_URL` empty to let the form's site URL drive the labeller.
-- **Ghost:** the Turnstile snippet is added to **Code injection → Site header**, wrapped in `<!-- ghost-guard:start -->` … `<!-- ghost-guard:end -->`. HTML outside those markers is left in place. A re-run replaces only that block. The Admin API key is the `id:secret` from a **custom integration**. Ghost only allows webhook creation on that same integration; the form sends the key's id and, if Ghost rejects it, retries without forcing a different integration.
-- **Webhook, if checked:** one `member.added` webhook aimed at `https://<host>/signup-shield/webhooks/member-added` (the domain root, even when Ghost is in a subfolder). The label stays `signup-shield-review`. The Admin API key is stored only in this case.
+- **Cloudflare:** route `<host>/*` on the Worker, reused when already attached, and a managed Turnstile widget named `ghost-guard-<host>` for that hostname. The form does not deploy Worker secrets.
+- **Configuration:** `SetupStore` is the source of truth for settings saved through this form: Turnstile, the Ghost subfolder, and optional labeller credentials. Those saved fields override old environment values, including when the labeller is turned off. Manual installations with no saved setup configuration use environment variables. To change a guided installation, run the form again. Configuration read failures return 503 on signup and webhook requests; background labelling retries. With same-zone forwarding, ordinary pages, assets, sign-in and the confirmation interstitial do not read the setup store. A direct `GHOST_ORIGIN` needs a read to select the Ghost subfolder before forwarding.
+- **Ghost snippet:** you paste the displayed public-key snippet into Site Header yourself. Integration API keys cannot edit Ghost settings. The widget secret stays in storage and is never included in HTML. Activation requires the setup token and confirmation that the snippet was saved.
+- **Optional webhook labeller:** check the box and supply a custom integration’s Admin API key (`id:secret`) plus a random webhook secret of at least 16 characters. After saving, open that integration in Ghost Admin and add a **Member added** webhook targeting `https://<host>/signup-shield/webhooks/member-added`, with the same secret. Update an existing matching webhook instead of creating another. No webhook-list API is called. Check a test delivery in Ghost Admin. Unchecking the box on a later setup run disables the labeller and clears its stored credentials.
 
-Submitting again is safe: an existing route, widget, and webhook are reused, and the header block is not duplicated. The result is a checklist. A red row includes a one-line fix. The confirmation check uses a fake token and does not create a member. The sign-in check uses `ghost-guard-setup-check@example.invalid` and does not create a member. A Worker cannot fetch its own zone (that request skips the Worker), so if you open setup on the Ghost hostname the route row says the page itself is the proof.
+Repeat runs reuse the route and widget. An active widget remains active when its hostname and public key stay the same; a new widget waits for snippet installation and activation. Failed preparation leaves the previous stored configuration in place. The result includes a checklist; a red row gives a suggested fix. The confirmation check uses a fake token, and the sign-in check uses `ghost-guard-setup-check@example.invalid`; neither creates a member. A Worker fetch to its own zone skips the Worker, so open the public script and test confirmation and sign-in in a browser too.
 
 The form does not set `GHOST_ORIGIN` or `CONFIRM_SECRET`. With no direct origin, the Worker forwards to the hostname's normal Cloudflare origin and does not need the bypass secret. Set those two by hand when Ghost is not that origin; the manual section below has the commands. Quotas and `SITE_TITLE` stay in `wrangler.toml`. The Node sidecar does not call the Cloudflare API; it shows a short page that links here.
 
@@ -63,7 +66,7 @@ The form does not set `GHOST_ORIGIN` or `CONFIRM_SECRET`. With no direct origin,
 
 ## Advanced: manual Cloudflare setup
 
-Use this when you are not using `/ghost-guard/setup`. The [Quick start](#quick-start) form does these steps for you.
+Use this when you are not using `/ghost-guard/setup`. The [Quick start](#quick-start) flow guides the route, widget, snippet installation and activation.
 
 Your Ghost hostname must already be proxied by Cloudflare.
 
@@ -115,7 +118,7 @@ For a custom client, send the token either as the `cf-turnstile-response` header
 {"errors":[{"message":"Unable to verify your request, please try again","type":"ValidationError"}]}
 ```
 
-**Turnstile is optional:** if `TURNSTILE_SECRET` is unset, token verification is skipped. Quotas and the click-to-confirm page remain active. To disable it cleanly, remove the Code Injection snippet as well. Configure the snippet and secret together. A widget alone is insufficient; see [Cloudflare's server validation requirements](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
+**Turnstile is optional:** in manual installations, if `TURNSTILE_SECRET` is unset, token verification is skipped. Guided installations use the stored secret after activation. Quotas and the click-to-confirm page remain active. To disable it cleanly, remove the Code Injection snippet as well. Configure the snippet and secret together. A widget alone is insufficient; see [Cloudflare's server validation requirements](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
 
 ### Rate limits and storage
 
@@ -197,7 +200,7 @@ CLEANUP_ENABLED = "true"
 ADMIN_API_URL = "https://your-site.ghost.io"   # include the subfolder, e.g. https://example.com/blog
 ```
 
-Create a **Custom Integration** in Ghost Admin with a **Member added** webhook targeting the integration that owns the Admin API key (Ghost rejects webhooks for any other integration). The setup form does this when the labeller box is checked. By hand, target:
+In Ghost Admin, open the **Custom Integration** that owns the Admin API key and add a **Member added** webhook. For a guided installation, use the target shown by setup and the secret you entered there. For a manual webhook-only installation, target:
 
 ```text
 https://YOUR-WORKER.workers.dev/signup-shield/webhooks/member-added
@@ -214,7 +217,7 @@ The Worker routes each member's deliveries through the same **`MemberLabeller` D
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SETUP_TOKEN` | unset | Password for `/ghost-guard/setup`. `npx wrangler secret put SETUP_TOKEN`, or the value the Deploy button asks for. If it is empty, the first visit generates one and prints it only to the Worker logs |
-| `SETUP_STORE` | Wrangler binding | Durable Object the setup page writes. The Worker reads it when the matching environment value is unset |
+| `SETUP_STORE` | Wrangler binding | Durable Object holding guided setup settings; saved fields override environment values |
 | `GHOST_ORIGIN` | Worker: same-zone; sidecar: `http://127.0.0.1:2368` | Direct Ghost origin; Worker secret recommended. Not set by the setup form |
 | `CONFIRM_SECRET` | unset | Worker's secret bypass header for confirmation forwarding |
 | `SITE_TITLE` | `this publication` | Name on the confirmation page |
