@@ -889,27 +889,6 @@ test('a failed save after a rejected secret does not report Turnstile as switche
   assert.equal(warn.mock.callCount(), 0);
 });
 
-test('a secret Cloudflare rejected is not reused on the next run, so setup rotates instead', async (t) => {
-  const state = world();
-  install(t, state);
-  t.mock.method(console, 'warn', () => {});
-  const store = memoryStore(), env = baseEnv(store);
-  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
-  // The widget API stops returning the secret, and the saved one is rejected.
-  delete state.widgets[0].secret;
-  state.turnstileRejects = true;
-  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  assert.equal(store.data.get('config').turnstileRejected, true);
-  assert.equal(state.rotations || 0, 0);
-  // Next run: the rejected secret is skipped and the widget secret is rotated.
-  state.turnstileRejects = false;
-  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
-  assert.equal(state.rotations, 1);
-  assert.equal(store.data.get('config').turnstileVerified, true);
-  assert.equal(store.data.get('config').turnstileRejected, false);
-});
-
 test('a demotion with a Worker TURNSTILE_SECRET warns that signups will be rejected, not protected', async (t) => {
   const state = world();
   install(t, state);
@@ -919,6 +898,6 @@ test('a demotion with a Worker TURNSTILE_SECRET warns that signups will be rejec
   await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
   state.turnstileRejects = true;
   const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
-  assert.match(rerun, /rejects every signup unless Ghost Site Header carries that widget/);
+  assert.match(rerun, /rejects every signup unless Ghost Site Header carries the site key of the widget that secret belongs to/);
   assert.doesNotMatch(rerun, /fall back/);
 });

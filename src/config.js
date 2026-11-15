@@ -11,8 +11,11 @@ const cache = new WeakMap();
 export function mergeConfig(env, stored) {
   if (!stored || typeof stored !== 'object') return env;
   const next = { ...env };
-  // A prepared widget takes over only once activated. Until then a manually
-  // configured TURNSTILE_SECRET (if any) keeps protecting signups.
+  // A prepared widget takes over only once activated. Until then (or after a
+  // rerun switches it off) signups are checked with the Worker's own
+  // TURNSTILE_SECRET, if set. That only works while Ghost Site Header still
+  // carries that secret's widget; with setup's snippet installed it rejects
+  // every signup, so remove the Worker secret once setup's widget is active.
   if (Object.hasOwn(stored, 'turnstileSecret') && stored.turnstileEnabled !== false) {
     next.TURNSTILE_SECRET = stored.turnstileSecret;
     next.TURNSTILE_HOSTNAME = stored.hostname || '';

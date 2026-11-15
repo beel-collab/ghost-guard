@@ -103,7 +103,6 @@ export function sanitizeConfig(input) {
     turnstileSecret: String(source.turnstileSecret || '').slice(0, 256),
     turnstileEnabled: source.turnstileEnabled !== false,
     turnstileVerified: source.turnstileVerified === true,
-    turnstileRejected: source.turnstileRejected === true,
     webhookEnabled,
     webhookSecret: webhookEnabled ? String(source.webhookSecret || '').slice(0, MAX_WEBHOOK_SECRET_LENGTH) : '',
     adminApiUrl: webhookEnabled ? String(source.adminApiUrl || '').slice(0, 500) : '',
@@ -830,14 +829,10 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
         const detail = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/accounts/${ctx.accountId}/challenges/widgets/${encodeURIComponent(widget.sitekey)}`);
         widget = { ...widget, ...detail.result };
       }
-      // A saved secret Cloudflare rejected last run is never reused, so a rerun
-      // can rotate its way out instead of failing the same way every time.
-      const rejectedSecret = previous?.turnstileRejected === true ? previous.turnstileSecret : '';
-      const usable = (secret) => (secret && secret !== rejectedSecret ? secret : '');
-      if (!widget.secret && previous?.turnstileSitekey === widget.sitekey) {
-        widget = { ...widget, secret: usable(previous.turnstileSecret) };
+      if (!widget.secret && previous?.turnstileSitekey === widget.sitekey && previous.turnstileSecret) {
+        widget = { ...widget, secret: previous.turnstileSecret };
       }
-      if (!widget.secret) widget = { ...widget, secret: usable(await readWidgetSecret(env, widget.sitekey)) };
+      if (!widget.secret) widget = { ...widget, secret: await readWidgetSecret(env, widget.sitekey) };
       if (!widget.secret) {
         const rotated = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/accounts/${ctx.accountId}/challenges/widgets/${encodeURIComponent(widget.sitekey)}/rotate_secret`, {
           method: 'POST',
@@ -867,14 +862,14 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   const outcome = turnstileOutcome(previous, ctx, turnstile, saved.turnstileEnabled);
   const demotedNote = outcome.demoted
     ? `Turnstile protection is now off because ${outcome.demoted}. ${env.TURNSTILE_SECRET
-      ? 'Signups are now checked with the TURNSTILE_SECRET set on the Worker, which rejects every signup unless Ghost Site Header carries that widget’s site key'
+      ? 'Signups are now checked with the TURNSTILE_SECRET set on the Worker, which rejects every signup unless Ghost Site Header carries the site key of the widget that secret belongs to'
       : 'Signups are not challenged'} until setup succeeds and you activate again.`
     : '';
   const reported = checks.map((check) => check !== turnstile ? check : {
     ...check, detail: [outcome.note || check.detail, demotedNote].filter(Boolean).join(' '),
   });
   let config = {
-    ...saved, turnstileVerified: outcome.verified, turnstileEnabled: outcome.enabled, turnstileRejected: turnstile.rejected === true, complete: true,
+    ...saved, turnstileVerified: outcome.verified, turnstileEnabled: outcome.enabled, complete: true,
     checklist: reported.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })),
   };
   // A failed save changes nothing, so it must not report a demotion.
@@ -900,9 +895,7 @@ function turnstileOutcome(previous, ctx, check, sameActiveWidget) {
     verified,
     note: enabled && !check.ok ? 'Turnstile could not confirm the widget secret right now, so protection stays active. Run setup again later to recheck.' : '',
     demoted: !wasActive || enabled ? ''
-      : check.rejected ? 'Cloudflare rejected the widget secret'
-        : previous.turnstileSitekey === ctx.turnstileSitekey ? 'setup now serves a different hostname'
-          : 'this run prepared a different Turnstile widget',
+      : check.rejected ? 'Cloudflare rejected the widget secret' : 'this run prepared a different Turnstile widget',
   };
 }
 
