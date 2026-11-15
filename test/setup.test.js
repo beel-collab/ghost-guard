@@ -360,20 +360,31 @@ test('setup alarms sweep expired login records in batches without deleting confi
   assert.equal(store.storage.alarm, null);
 });
 
-test('signup-only setup needs no Ghost credentials; disabling the labeller clears its stored credentials', async (t) => {
+test('signup-only setup leaves a manual labeller alone; a rerun keeps the labeller; turning it off clears it', async (t) => {
   const state = world();
   install(t, state);
   const store = memoryStore();
   const env = baseEnv(store);
-  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const manual = {CLEANUP_ENABLED:'true',ADMIN_API_KEY:ADMIN_KEY};
   const {webhook, webhook_secret, admin_api_key, ...fields} = happyFields;
-  const response = await worker.fetch(formRequest('/ghost-guard/setup', fields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', fields), env);
+  assert.equal(mergeConfig(manual, store.data.get('config')).CLEANUP_ENABLED, 'true');
+  assert.equal(mergeConfig(manual, store.data.get('config')).ADMIN_API_KEY, ADMIN_KEY);
+
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const rerun = await worker.fetch(formRequest('/ghost-guard/setup', fields), env);
+  assert.match(await rerun.text(), /Cloudflare ready/);
+  assert.equal(store.data.get('config').cleanupEnabled, 'true');
+  assert.equal(store.data.get('config').adminApiKey, ADMIN_KEY);
+  assert.equal(store.data.get('config').webhookSecret, happyFields.webhook_secret);
+
+  const response = await worker.fetch(formRequest('/ghost-guard/setup', {...fields, webhook:'off'}), env);
   assert.match(await response.text(), /Cloudflare ready/);
   const saved = store.data.get('config');
   assert.equal(saved.cleanupEnabled, 'false');
   assert.equal(saved.adminApiKey, '');
   assert.equal(saved.webhookSecret, '');
-  const effective = mergeConfig({CLEANUP_ENABLED:'true',ADMIN_API_KEY:ADMIN_KEY}, saved);
+  const effective = mergeConfig(manual, saved);
   assert.equal(effective.CLEANUP_ENABLED, 'false');
   assert.equal(effective.ADMIN_API_KEY, '');
 });
@@ -471,6 +482,34 @@ test('a rerun from the public hostname reuses the saved script name and checks t
   // The confirmation page came from the guard itself, and sign-in went to Ghost's origin.
   assert.equal(state.calls.some(call => call.url.hostname === 'example.com' && call.url.pathname === '/blog/members/'), false);
   assert.ok(state.calls.some(call => call.url.hostname === 'origin.example' && call.url.pathname.endsWith('/send-magic-link/')));
+});
+
+test('first setup on a custom hostname adopts the Worker its route runs, or stops if unknown', async (t) => {
+  const state = world();
+  state.routes.push({ id: 'route-1', pattern: 'example.com/*', script: 'my-guard' });
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  const onHost = (fields) => { const r = formRequest('/ghost-guard/setup', fields); return new Request(r.url.replace('ghost-guard.tester.workers.dev', 'example.com'), r); };
+  assert.match(await (await worker.fetch(onHost(happyFields), env)).text(), /Cloudflare ready/);
+  assert.equal(store.data.get('config').scriptName, 'my-guard');
+  const other = memoryStore();
+  const elsewhere = formRequest('/ghost-guard/setup', happyFields);
+  const html = await (await worker.fetch(new Request(elsewhere.url.replace('ghost-guard.tester.workers.dev', 'setup.other.example'), elsewhere), baseEnv(other))).text();
+  assert.match(html, /Worker name is unknown/);
+  assert.equal(state.routePosts, 0);
+});
+
+test('same-host checks use the subfolder entered in this run, not the saved one', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  store.data.set('config', { ghostBasePath: '/old', scriptName: 'ghost-guard' });
+  const r = formRequest('/ghost-guard/setup', happyFields);
+  await worker.fetch(new Request(r.url.replace('ghost-guard.tester.workers.dev', 'example.com'), r), env);
+  const signin = store.data.get('config').checklist.find(check => check.title === 'Sign-in passthrough');
+  assert.equal(signin.ok, true, signin.detail);
+  const signins = state.calls.filter(call => call.url.pathname === '/blog/members/api/send-magic-link/');
+  assert.deepEqual(signins.map(call => call.url.hostname), ['origin.example']);
 });
 
 test('Ghost rejecting a sign-in for an unknown member still passes the sign-in check', async (t) => {

@@ -139,9 +139,6 @@ export async function handleMemberAddedWebhook(request, env) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
-  if (env.CLEANUP_ENABLED !== 'true') {
-    return json({ ok: false, error: 'cleanup disabled' }, 503);
-  }
   const raw = await request.text();
   // Signature first. Missing-config details (URL shape, key form) are only
   // returned after a valid signature, so an unsigned caller cannot probe them.
@@ -155,6 +152,10 @@ export async function handleMemberAddedWebhook(request, env) {
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
   if (!valid) {
     return json({ ok: false, error: 'invalid signature' }, 401);
+  }
+  // Only signed requests learn whether the labeller is switched on.
+  if (env.CLEANUP_ENABLED !== 'true') {
+    return json({ ok: false, error: 'cleanup disabled' }, 503);
   }
   // Labelling runs after the 202, so report settings that can never work now,
   // where Ghost Admin's webhook status shows them. Only signed requests see this.

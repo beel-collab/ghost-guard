@@ -216,6 +216,15 @@ for (const [name, config] of [
   });
 }
 
+test('unsigned requests cannot tell whether the labeller is switched on', async (t) => {
+  ghost(t);
+  const unsigned = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
+  const on = await worker.fetch(unsigned(), env);
+  const off = await worker.fetch(unsigned(), { ...env, CLEANUP_ENABLED: 'false' });
+  assert.equal(off.status, on.status);
+  assert.deepEqual(await off.json(), await on.json());
+});
+
 test('unsigned requests learn nothing about the Admin API configuration', async (t) => {
   ghost(t);
   const unsigned = new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
@@ -345,6 +354,7 @@ test('a pending alarm stops when the labeller is disabled in saved configuration
   const { storage, fire, config } = durable({SETUP_STORE});
   assert.equal((await worker.fetch(event(), config)).status, 202);
   saved.cleanupEnabled = 'false';
+  saved.labellerDisabled = true;
   await fire();
   assert.equal(state.calls.length, 0);
   assert.equal(storage.data.size, 0);

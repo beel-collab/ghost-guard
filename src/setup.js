@@ -39,7 +39,9 @@ export function mergeConfig(env, stored) {
     next.TURNSTILE_HOSTNAME = stored.hostname || '';
   }
   if (Object.hasOwn(stored, 'ghostBasePath')) next.GHOST_BASE_PATH = stored.ghostBasePath;
-  if (Object.hasOwn(stored, 'cleanupEnabled')) {
+  // Setup owns the labeller only once it enabled or explicitly turned it off.
+  // A run that left it alone keeps a manually configured labeller working.
+  if (stored.cleanupEnabled === 'true' || stored.labellerDisabled === true) {
     next.CLEANUP_ENABLED = stored.cleanupEnabled;
     next.WEBHOOK_SECRET = stored.webhookSecret || '';
     next.ADMIN_API_KEY = stored.adminApiKey || '';
@@ -135,6 +137,7 @@ export function sanitizeConfig(input) {
     adminApiUrl: webhookEnabled ? String(source.adminApiUrl || '').slice(0, 500) : '',
     adminApiKey: webhookEnabled ? String(source.adminApiKey || '').slice(0, 128) : '',
     cleanupEnabled: webhookEnabled ? 'true' : 'false',
+    labellerDisabled: !webhookEnabled && source.labellerDisabled === true,
     scriptName: String(source.scriptName || 'ghost-guard').slice(0, 64),
     checklist: sanitizeChecklist(source.checklist),
     updatedAt: Date.now(),
@@ -326,7 +329,17 @@ export function scriptNameFrom(request, env, stored) {
   const match = host.match(/^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/);
   if (match) return match[1];
   const saved = String(stored?.scriptName || '');
-  return valid(saved) ? saved : 'ghost-guard';
+  return valid(saved) ? saved : '';
+}
+
+// The routes on this hostname that would carry a request for the setup page.
+function routesServingSetup(routes, hostname) {
+  return routes.filter((route) => {
+    const match = String(route.pattern).toLowerCase().match(/^(?:https?:\/\/)?([^/]+)(\/.*)?$/);
+    if (!match || match[1] !== hostname) return false;
+    const path = (match[2] || '/').replace(/\/{2,}/g, '/');
+    return path.endsWith('*') ? '/ghost-guard/setup'.startsWith(path.slice(0, -1)) : path.replace(/\/+$/, '') === '/ghost-guard/setup';
+  });
 }
 
 function layout(title, body) {
@@ -395,7 +408,8 @@ function renderGate({ generated }) {
 }
 
 function formFields(values = {}) {
-  const check = values.webhook ? ' checked' : '';
+  const mode = ['on', 'off'].includes(values.webhook) ? values.webhook : 'keep';
+  const radio = (value, text) => `<label class="check"><input name="webhook" type="radio" value="${value}"${mode === value ? ' checked' : ''}> ${text}</label>`;
   return `<form method="post" action="" autocomplete="off">
       <input type="hidden" name="intent" value="run">
       <label for="setup_token">Setup token</label>
@@ -412,7 +426,11 @@ function formFields(values = {}) {
       <label for="ghost_base_path">Ghost subfolder <span class="hint">(optional)</span></label>
       <input id="ghost_base_path" name="ghost_base_path" type="text" maxlength="200" placeholder="/blog" value="${escapeHtml(values.ghost_base_path || '')}">
       <p class="hint">Only if GHOST_ORIGIN is set and Ghost is not at the domain root. Leave blank to use the path from the site URL.</p>
-      <label class="check"><input name="webhook" type="checkbox" value="on"${check}> Enable the webhook labeller</label>
+      <fieldset><legend>Webhook labeller</legend>
+      ${radio('keep', 'Keep the current setting')}
+      ${radio('on', 'Enable, or replace the key and secret')}
+      ${radio('off', 'Turn the labeller off')}
+      </fieldset>
       <p class="hint">Adds the label signup-shield-review to new free members from non-consumer domains. Does not delete members. After saving, add a Member added webhook in Ghost Admin using the instructions below.</p>
       <label for="admin_api_key">Ghost Admin API key <span class="hint">(labeller only)</span></label>
       <input id="admin_api_key" name="admin_api_key" type="password" maxlength="128" autocomplete="off" placeholder="id:secret">
@@ -565,8 +583,8 @@ export async function handleSetup(request, env) {
         throw httpError('Save the Cloudflare configuration and install the Ghost snippet before activating.', 400);
       }
       const res = await storeFetch(env, '/activate', { method: 'POST', body: JSON.stringify({ expectedRevision: String(form.get('config_revision') || '') }) });
-      const body = await res.json();
-      if (!res.ok) throw httpError(body.error || 'Activation could not be saved. Try again.', res.status);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw httpError(body.error || 'Activation could not be saved. Try again.', res.status >= 500 ? 503 : res.status);
       return htmlResponse(200, renderStatus(body.value));
     }
     const config = await readConfig(env);
@@ -578,7 +596,7 @@ export async function handleSetup(request, env) {
       ghost_url: ghostUrl,
       account_id: String(form.get('account_id') || '').trim(),
       ghost_base_path: String(form.get('ghost_base_path') || '').trim(),
-      webhook: form.get('webhook') != null,
+      webhook: String(form.get('webhook') || 'keep'),
       webhook_secret: String(form.get('webhook_secret') || ''),
     };
     const cfToken = String(form.get('cf_api_token') || '');
@@ -724,24 +742,28 @@ async function listWidgets(token, accountId) {
 
 async function runSetup({ request, env, previous, values, cfToken, adminKey, secrets }) {
   if (!nonempty(cfToken) || cfToken.length > 4096) throw httpError('Fix: enter a Cloudflare API token.', 400);
-  if (values.webhook && !ADMIN_KEY_PATTERN.test(adminKey)) {
+  if (values.webhook === 'on' && !ADMIN_KEY_PATTERN.test(adminKey)) {
     throw httpError('Fix: the Ghost Admin API key must be the id:secret value from a custom integration.', 400);
   }
-  if (values.webhook && (values.webhook_secret.length < 16 || values.webhook_secret.length > MAX_WEBHOOK_SECRET_LENGTH)) {
+  if (values.webhook === 'on' && (values.webhook_secret.length < 16 || values.webhook_secret.length > MAX_WEBHOOK_SECRET_LENGTH)) {
     throw httpError('Fix: choose a webhook secret between 16 and 191 characters.', 400);
   }
   if (values.account_id && !/^[a-f0-9]{32}$/i.test(values.account_id)) {
     throw httpError('Fix: the account ID is the 32-character id from the Cloudflare dashboard, or leave it blank.', 400);
   }
   const site = await parseSite(values);
-  const scriptName = scriptNameFrom(request, env, previous);
+  const kept = values.webhook === 'keep' && previous?.cleanupEnabled === 'true' && previous.adminApiKey && previous.webhookSecret;
+  const labeller = values.webhook === 'on' ? { key: adminKey, secret: values.webhook_secret }
+    : kept ? { key: previous.adminApiKey, secret: previous.webhookSecret } : null;
+  if (labeller) secrets.push(labeller.key, labeller.key.split(':')[1], labeller.secret);
   const ctx = {
     ...site,
     adminApiUrl: adminApiUrlFor(env, site),
     env,
-    scriptName,
+    scriptName: scriptNameFrom(request, env, previous),
     accountId: values.account_id.toLowerCase(),
-    webhookEnabled: values.webhook === true,
+    webhookEnabled: labeller !== null,
+    labellerDisabled: values.webhook === 'off' || (values.webhook === 'keep' && previous?.labellerDisabled === true),
     requestHost: new URL(request.url).hostname.toLowerCase(),
     secrets,
   };
@@ -766,10 +788,11 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
     turnstileSecret: ctx.turnstileSecret || '',
     turnstileEnabled: previous?.turnstileEnabled !== false && previous?.turnstileSitekey === ctx.turnstileSitekey && previous?.hostname === ctx.hostname,
     webhookEnabled: ctx.webhookEnabled,
-    webhookSecret: ctx.webhookEnabled ? values.webhook_secret : '',
+    webhookSecret: labeller?.secret || '',
+    labellerDisabled: ctx.labellerDisabled,
     adminApiUrl: ctx.webhookEnabled ? ctx.adminApiUrl : '',
-    adminApiKey: ctx.webhookEnabled ? adminKey : '',
-    scriptName,
+    adminApiKey: labeller?.key || '',
+    scriptName: ctx.scriptName,
     checklist: [],
   });
 
@@ -788,6 +811,13 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
     const pattern = `${ctx.hostname}/*`;
     const data = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/zones/${ctx.zoneId}/workers/routes`);
     const routes = data.result || [];
+    if (!ctx.scriptName) {
+      // This page loaded on that hostname, so a route there runs this Worker.
+      const scripts = new Set(ctx.requestHost === ctx.hostname ? routesServingSetup(routes, ctx.hostname).map((route) => route.script).filter(Boolean) : []);
+      if (scripts.size !== 1) throw httpError('Fix: the Worker name is unknown here. Open setup on the Worker’s workers.dev URL, or set the SCRIPT_NAME variable to the Worker name, then run setup again.', 400);
+      ctx.scriptName = [...scripts][0];
+    }
+    const scriptName = ctx.scriptName;
     const conflicts = conflictingRoutes(routes, ctx.hostname, ctx.ghostBasePath, scriptName);
     if (conflicts.length) throw httpError(`Fix: conflicting Cloudflare routes can bypass protection: ${conflicts.map((route) => route.pattern).join(', ')}. Remove those routes or assign them to ${scriptName}, then run setup again.`, 409);
     const existing = routes.find((route) => route.pattern.toLowerCase() === pattern);
@@ -876,7 +906,8 @@ function runChecks(ctx) {
 async function guardFetch(ctx, url, init) {
   if (ctx.requestHost !== ctx.hostname) return fetch(url, init);
   const { default: worker } = await import('./worker.js');
-  return worker.fetch(new Request(url, init), ctx.env);
+  const checkEnv = { ...ctx.env, SETUP_STORE: undefined, GHOST_BASE_PATH: ctx.ghostBasePath };
+  return worker.fetch(new Request(url, init), checkEnv);
 }
 
 async function checkRoute(ctx) {
