@@ -471,3 +471,78 @@ test('bad setup inputs and activation before preparation call no external APIs',
   }
   assert.equal(state.calls.length,0);
 });
+
+test('webhook secrets respect Ghost’s 191-character boundary', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  const form = await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env);
+  assert.match(await form.text(), /name="webhook_secret"[^>]*maxlength="191"/);
+  const rejected = await worker.fetch(formRequest('/ghost-guard/setup', { ...happyFields, webhook_secret: 'x'.repeat(192) }), env);
+  assert.equal(rejected.status, 400);
+  assert.equal(state.calls.length, 0);
+  const allowed = await worker.fetch(formRequest('/ghost-guard/setup', { ...happyFields, webhook_secret: 'x'.repeat(191) }), env);
+  assert.match(await allowed.text(), /Cloudflare ready/);
+  assert.equal(store.data.get('config').webhookSecret.length, 191);
+});
+
+test('guided Turnstile uses the saved public hostname while manual installations keep their override', async (t) => {
+  const store = memoryStore();
+  store.data.set('config', { hostname: 'example.com', turnstileSecret: 'saved-secret', turnstileEnabled: true });
+  const env = baseEnv(store, { TURNSTILE_HOSTNAME: 'old.example' });
+  let forwarded = 0;
+  let verifiedHostname = 'example.com';
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    if (String(input) === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
+      assert.equal(new URLSearchParams(init.body).get('secret'), 'saved-secret');
+      return Response.json({ success: true, hostname: verifiedHostname, action: 'ghost_signup' });
+    }
+    forwarded++;
+    return new Response('origin', { status: 201 });
+  });
+  const request = () => new Request(signup(), { headers: { 'content-type': 'application/json', 'cf-turnstile-response': 'valid' } });
+  assert.equal((await worker.fetch(request(), env)).status, 201);
+  verifiedHostname = 'old.example';
+  assert.equal((await worker.fetch(request(), env)).status, 400);
+  assert.equal(forwarded, 1);
+  assert.equal(mergeConfig({ TURNSTILE_HOSTNAME: 'manual.example' }, null).TURNSTILE_HOSTNAME, 'manual.example');
+});
+
+test('setup bounds actual body bytes with missing or misleading Content-Length', async () => {
+  for (const length of [undefined, '1']) {
+    const store = memoryStore();
+    const headers = { 'content-type': 'application/x-www-form-urlencoded', ...(length ? { 'content-length': length } : {}) };
+    const response = await worker.fetch(new Request('https://example.com/ghost-guard/setup', { method: 'POST', headers, body: 'padding=' + 'x'.repeat(64 * 1024) }), baseEnv(store));
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /setup form is too large/);
+    assert.equal(store.data.size, 0);
+  }
+  const store = memoryStore();
+  const atLimit = await worker.fetch(new Request('https://example.com/ghost-guard/setup', {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'padding=' + 'x'.repeat(64 * 1024 - 8),
+  }), baseEnv(store));
+  assert.equal(atLimit.status, 401);
+  const multipart = '--boundary\r\nContent-Disposition: form-data; name="padding"\r\n\r\n' + 'x'.repeat(64 * 1024) + '\r\n--boundary--\r\n';
+  const oversizedMultipart = await worker.fetch(new Request('https://example.com/ghost-guard/setup', {
+    method: 'POST', body: multipart, headers: { 'content-type': 'multipart/form-data; boundary=boundary' },
+  }), baseEnv(store));
+  assert.equal(oversizedMultipart.status, 400);
+});
+
+test('setup cancels a chunked body as soon as it exceeds the limit', async () => {
+  let pulls = 0, cancelled = false;
+  const stream = new ReadableStream({
+    pull(controller) {
+      pulls++;
+      if (pulls > 100) controller.close();
+      else controller.enqueue(new Uint8Array(4096).fill(120));
+    },
+    cancel() { cancelled = true; },
+  });
+  const response = await worker.fetch(new Request('https://example.com/ghost-guard/setup', {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: stream, duplex: 'half',
+  }), baseEnv(memoryStore()));
+  assert.equal(response.status, 400);
+  assert.equal(cancelled, true);
+  assert.ok(pulls < 100);
+});

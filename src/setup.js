@@ -11,6 +11,8 @@ export const SETUP_FAILURE_LIMIT = 8;
 export const SETUP_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 
 const WIDGET_MODE = 'managed';
+const MAX_WEBHOOK_SECRET_LENGTH = 191;
+const MAX_SETUP_BODY_BYTES = 64 * 1024;
 
 export function pageHeaders() {
   return {
@@ -32,6 +34,7 @@ export function mergeConfig(env, stored) {
   const next = { ...env };
   if (Object.hasOwn(stored, 'turnstileSecret')) {
     next.TURNSTILE_SECRET = stored.turnstileEnabled === false ? '' : stored.turnstileSecret;
+    next.TURNSTILE_HOSTNAME = stored.hostname || '';
   }
   if (Object.hasOwn(stored, 'ghostBasePath')) next.GHOST_BASE_PATH = stored.ghostBasePath;
   if (Object.hasOwn(stored, 'cleanupEnabled')) {
@@ -126,7 +129,7 @@ export function sanitizeConfig(input) {
     turnstileSecret: String(source.turnstileSecret || '').slice(0, 256),
     turnstileEnabled: source.turnstileEnabled !== false,
     webhookEnabled,
-    webhookSecret: webhookEnabled ? String(source.webhookSecret || '').slice(0, 256) : '',
+    webhookSecret: webhookEnabled ? String(source.webhookSecret || '').slice(0, MAX_WEBHOOK_SECRET_LENGTH) : '',
     adminApiUrl: webhookEnabled ? String(source.adminApiUrl || '').slice(0, 500) : '',
     adminApiKey: webhookEnabled ? String(source.adminApiKey || '').slice(0, 128) : '',
     cleanupEnabled: webhookEnabled ? 'true' : 'false',
@@ -386,8 +389,8 @@ function formFields(values = {}) {
       <input id="admin_api_key" name="admin_api_key" type="password" maxlength="128" autocomplete="off" placeholder="id:secret">
       <p class="hint">From a custom integration in Ghost Admin → Settings → Advanced → Integrations. Required only when enabling the labeller.</p>
       <label for="webhook_secret">Webhook secret <span class="hint">(labeller only)</span></label>
-      <input id="webhook_secret" name="webhook_secret" type="password" minlength="16" maxlength="256" autocomplete="off">
-      <p class="hint">Choose a random secret of at least 16 characters. Enter the same secret when adding the webhook in Ghost. Required each time you enable the labeller.</p>
+      <input id="webhook_secret" name="webhook_secret" type="password" minlength="16" maxlength="${MAX_WEBHOOK_SECRET_LENGTH}" autocomplete="off">
+      <p class="hint">Choose a random secret of 16–191 characters. Enter the same secret when adding the webhook in Ghost. Required each time you enable the labeller.</p>
       <button type="submit">Prepare Cloudflare</button>
     </form>`;
 }
@@ -465,15 +468,34 @@ function htmlResponse(status, html, extra) {
 
 async function readForm(request) {
   const length = Number(request.headers.get('content-length') || 0);
-  if (Number.isFinite(length) && length > 64 * 1024) throw httpError('The setup form is too large.', 400);
+  if (Number.isFinite(length) && length > MAX_SETUP_BODY_BYTES) throw httpError('The setup form is too large.', 400);
   const type = request.headers.get('content-type') || '';
   if (!type.includes('application/x-www-form-urlencoded') && !type.includes('multipart/form-data')) {
     throw httpError('Submit the setup form from this page.', 400);
   }
+  const reader = request.body?.getReader();
   try {
-    return await request.formData();
-  } catch {
+    const chunks = [];
+    let size = 0;
+    while (reader) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_SETUP_BODY_BYTES) {
+        await reader.cancel();
+        throw httpError('The setup form is too large.', 400);
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return await new Response(bytes, { headers: { 'content-type': type } }).formData();
+  } catch (error) {
+    if (error.status === 400) throw error;
     throw httpError('The setup form could not be read. Submit it again.', 400);
+  } finally {
+    reader?.releaseLock();
   }
 }
 
@@ -664,8 +686,8 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
   if (values.webhook && !ADMIN_KEY_PATTERN.test(adminKey)) {
     throw httpError('Fix: the Ghost Admin API key must be the id:secret value from a custom integration.', 400);
   }
-  if (values.webhook && (values.webhook_secret.length < 16 || values.webhook_secret.length > 256)) {
-    throw httpError('Fix: choose a webhook secret between 16 and 256 characters.', 400);
+  if (values.webhook && (values.webhook_secret.length < 16 || values.webhook_secret.length > MAX_WEBHOOK_SECRET_LENGTH)) {
+    throw httpError('Fix: choose a webhook secret between 16 and 191 characters.', 400);
   }
   if (values.account_id && !/^[a-f0-9]{32}$/i.test(values.account_id)) {
     throw httpError('Fix: the account ID is the 32-character id from the Cloudflare dashboard, or leave it blank.', 400);
