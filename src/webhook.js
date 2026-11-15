@@ -113,7 +113,7 @@ export class MemberLabeller {
     try {
       // Durable Objects receive deployment env, independently of Worker.fetch.
       // Reload setup settings on each attempt so retries see corrected config.
-      const env = await withStoredConfig(this.env, { fresh: true });
+      const env = await withStoredConfig(this.env, { maxAge: 0 });
       if (env.CLEANUP_ENABLED === 'true') await labelCurrentMember(env, id);
       // A delivery that arrived mid-run has scheduled another pass; keep its state.
       if ((await this.storage.getAlarm()) === null) await this.storage.deleteAll();

@@ -40,28 +40,33 @@ export async function readStoredConfig(env) {
   return (await res.json())?.value || null;
 }
 
+// Bumped on every forget, so a read that started before a save cannot put
+// the pre-save value back into the cache when it finishes.
+let generation = 0;
+
 export function forgetStoredConfig(env) {
+  generation++;
   if (env?.SETUP_STORE) cache.delete(env.SETUP_STORE);
 }
 
 // Only settled values are cached. Sharing an in-flight read would tie other
 // requests to the I/O of the request that started it, which may be cancelled.
 // Failures are not cached: the next request retries the store.
-async function cachedRead(env) {
+async function cachedRead(env, maxAge) {
   const key = env.SETUP_STORE;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CONFIG_CACHE_MS) return hit.value;
+  if (hit && Date.now() - hit.at < maxAge) return hit.value;
+  const started = generation;
   const value = await readStoredConfig(env);
-  cache.set(key, { at: Date.now(), value });
+  if (generation === started) cache.set(key, { at: Date.now(), value });
   return value;
 }
 
-/** `fresh: true` skips the isolate copy: webhooks (Ghost never retries one that
- * a stale secret rejected) and alarms must see the latest save. */
-export async function withStoredConfig(env, { fresh = false } = {}) {
+/** `maxAge` bounds how old this isolate's copy may be; 0 always reads the store. */
+export async function withStoredConfig(env, { maxAge = CONFIG_CACHE_MS } = {}) {
   if (!env?.SETUP_STORE) return env;
   try {
-    return mergeConfig(env, await (fresh ? readStoredConfig(env) : cachedRead(env)));
+    return mergeConfig(env, await cachedRead(env, maxAge));
   } catch (cause) {
     console.error(`ghost-guard: setup store read failed (${cause?.message || 'unknown error'})`);
     const error = new Error('Setup configuration is temporarily unavailable. Please try again later.');

@@ -466,3 +466,28 @@ test('Worker keeps a delivery that arrives during the final attempt', async (t) 
   assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
   assert.equal(storage.data.size, 0);
 });
+
+test('a webhook rejected by a cached secret retries once against recently refreshed settings', async (t) => {
+  ghost(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let reads = 0;
+  const stored = {
+    cleanupEnabled: 'true', adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: 'old-secret',
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { reads++; return Response.json({ value: stored }); } }; },
+  };
+  const { config } = durable({ SETUP_STORE, WEBHOOK_SECRET: '' });
+  assert.equal((await worker.fetch(event(), config)).status, 401);
+  // An unsigned flood costs no store reads while the copy is fresh.
+  for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(event(), config)).status, 401);
+  assert.equal(reads, 1);
+  // Setup saved a new secret in another isolate; the next delivery refreshes once.
+  stored.webhookSecret = env.WEBHOOK_SECRET;
+  now += 6_000;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  assert.equal(reads, 2);
+});

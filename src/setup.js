@@ -348,8 +348,9 @@ function layout(title, body) {
 </html>`;
 }
 
-function generatedNote(generated) {
+function generatedNote(generated, complete) {
   if (!generated) return '<p class="hint">Enter the SETUP_TOKEN for this Worker.</p>';
+  if (complete) return '<p class="hint">No SETUP_TOKEN is set. Enter the generated token you used for setup; it is no longer written to the logs. If you lost it, set your own with <code>npx wrangler secret put SETUP_TOKEN</code>.</p>';
   return '<p class="hint">No SETUP_TOKEN is set. A generated token is written to this Worker\'s logs, not this page. Run <code>npx wrangler tail</code>, reload this page, and copy the token from the log line. To choose your own: <code>npx wrangler secret put SETUP_TOKEN</code>.</p>';
 }
 
@@ -357,10 +358,10 @@ function renderMessage(message) {
   return layout('Set up ghost-guard', `<h1>Set up ghost-guard</h1><p class="error" role="alert">${escapeHtml(message)}</p><p><a href="/ghost-guard/setup">Back to setup</a></p>`);
 }
 
-function renderGate({ generated }) {
+function renderGate({ generated, complete }) {
   return layout('Set up ghost-guard', `<h1>ghost-guard setup</h1>
     <p>Cloudflare configuration is saved. Enter the setup token to view status. Running setup again asks for the token on the form.</p>
-    ${generatedNote(generated)}
+    ${generatedNote(generated, complete)}
     <form method="post" action="" autocomplete="off">
       <label for="setup_token">Setup token</label>
       <input id="setup_token" name="setup_token" type="password" required maxlength="256" autocomplete="current-password">
@@ -404,10 +405,10 @@ function formFields(values = {}) {
     </form>`;
 }
 
-function renderForm({ generated, values }) {
+function renderForm({ generated, complete, values }) {
   return layout('Set up ghost-guard', `<h1>Set up ghost-guard</h1>
     <p>Prepare the Worker route and Turnstile widget here. Then paste the snippet into Ghost and return to activate signup protection. Existing routes and widgets are reused.</p>
-    ${generatedNote(generated)}
+    ${generatedNote(generated, complete)}
     ${formFields(values)}`);
 }
 
@@ -534,14 +535,15 @@ export async function handleSetup(request, env) {
       // Repeated on each page load until setup completes: the operator often
       // starts `wrangler tail` after the first visit, or a crawler got there
       // first. Never logged for POSTs, and not once setup has used the token.
-      const generated = tokenInfo.source === 'stored' && !config?.complete;
-      if (generated) {
+      const generated = tokenInfo.source === 'stored';
+      const complete = config?.complete === true;
+      if (generated && !complete) {
         console.log(`ghost-guard: SETUP_TOKEN is not set. Setup token: ${tokenInfo.token}. Enter it at /ghost-guard/setup. It is not shown on the setup page. To set your own, run: npx wrangler secret put SETUP_TOKEN`);
       }
       if (config?.complete && url.searchParams.get('rerun') !== '1') {
-        return htmlResponse(200, renderGate({ generated }));
+        return htmlResponse(200, renderGate({ generated, complete }));
       }
-      return htmlResponse(200, renderForm({ generated }));
+      return htmlResponse(200, renderForm({ generated, complete }));
     }
     const form = await readForm(request);
     const provided = String(form.get('setup_token') || '');
@@ -855,10 +857,13 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   })) return { steps, checks: [], secrets, values, ok: false };
 
   const checks = await runChecks(ctx);
-  // A widget stays (or becomes) activatable only while Turnstile accepts its
-  // secret; a rerun with a rejected secret drops back to waiting.
+  // Only an explicit rejection of the secret demotes a widget. A siteverify
+  // outage keeps the previous state for the same widget: turning an active
+  // widget off would leave signups without Turnstile.
   const saved = persisted();
-  const turnstileVerified = checks.some((check) => check.title === TURNSTILE_CHECK && check.ok);
+  const turnstile = checks.find((check) => check.title === TURNSTILE_CHECK);
+  const sameWidget = previous?.turnstileSitekey === ctx.turnstileSitekey && previous?.hostname === ctx.hostname;
+  const turnstileVerified = turnstile.ok || (!turnstile.rejected && sameWidget && previous?.turnstileVerified === true);
   let config = { ...saved, turnstileVerified, turnstileEnabled: saved.turnstileEnabled && turnstileVerified, complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
   if (!await run('Save configuration', async () => {
     config = await writeConfig(env, config, previous?.revision || '');
@@ -922,7 +927,7 @@ async function checkTurnstile(ctx) {
     const data = await res.json();
     const codes = data['error-codes'] || [];
     if (codes.includes('invalid-input-secret') || codes.includes('missing-input-secret')) {
-      return { title, ok: false, detail: 'Fix: Turnstile rejected the widget secret. Run setup again.' };
+      return { title, ok: false, rejected: true, detail: 'Fix: Turnstile rejected the widget secret. Run setup again.' };
     }
     if (data.success === true || codes.includes('invalid-input-response')) {
       return { title, ok: true, detail: 'The Turnstile secret was accepted for this widget.' };

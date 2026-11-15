@@ -145,6 +145,7 @@ function install(t, state) {
     }
     if (url.hostname === 'challenges.cloudflare.com') {
       assert.equal(new URLSearchParams(bodyText).get('secret'), TURNSTILE_SECRET);
+      if (state.turnstileDown) return new Response('upstream error', { status: 502 });
       return json({ success: false, 'error-codes': [state.turnstileRejects ? 'invalid-input-secret' : 'invalid-input-response'] });
     }
     if (url.hostname === 'example.com' && url.pathname === '/ghost-guard/turnstile.js') {
@@ -788,4 +789,36 @@ test('a failed stored-config read is retried on the next request, not cached', a
   assert.equal((await worker.fetch(signup(), env)).status, 503);
   fail = false;
   assert.equal((await worker.fetch(signup(), env)).status, 201);
+});
+
+test('a siteverify outage during a rerun keeps an active widget active', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  state.turnstileDown = true;
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+  assert.equal(store.data.get('config').turnstileVerified, true);
+  // A first run that cannot reach siteverify is not activatable.
+  const fresh = memoryStore();
+  state.widgets.length = 0;
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(fresh));
+  assert.equal(fresh.data.get('config').turnstileVerified, false);
+});
+
+test('after setup completes, a generated token is explained without being logged', async (t) => {
+  const state = world();
+  install(t, state);
+  const logs = [];
+  t.mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
+  const store = memoryStore(), env = baseEnv(store, { SETUP_TOKEN: '' });
+  await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env);
+  const token = logs[0].match(/Setup token: ([a-f0-9]{64})/)[1];
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields, { token }), env);
+  const gate = await (await worker.fetch(new Request('https://example.com/ghost-guard/setup'), env)).text();
+  assert.match(gate, /no longer written to the logs/);
+  assert.match(gate, /wrangler secret put SETUP_TOKEN/);
+  assert.equal(logs.length, 1);
 });
