@@ -3,6 +3,7 @@
  * Cloudflare credentials are used only during the setup request.
  */
 import { ADMIN_KEY_PATTERN } from './webhook.js';
+import { ipBucket } from './rate-limit.js';
 
 export const GUARD_START = '<!-- ghost-guard:start -->';
 export const GUARD_END = '<!-- ghost-guard:end -->';
@@ -116,6 +117,7 @@ export function sanitizeConfig(input) {
   const source = input && typeof input === 'object' ? input : {};
   const webhookEnabled = source.webhookEnabled === true;
   return {
+    revision: randomToken(),
     complete: source.complete === true,
     hostname: String(source.hostname || '').slice(0, 253),
     siteUrl: String(source.siteUrl || '').slice(0, 500),
@@ -143,9 +145,35 @@ export class SetupStore {
   }
 
   fetch(request) {
-    const run = this.tail.then(() => this.#handle(request));
+    return this.#serialize(() => this.#handle(request));
+  }
+
+  alarm() {
+    return this.#serialize(() => this.#sweepFailures());
+  }
+
+  #serialize(operation) {
+    const run = this.tail.then(operation);
     this.tail = run.then(() => undefined, () => undefined);
     return run;
+  }
+
+  async #sweepFailures() {
+    const now = Date.now();
+    let startAfter;
+    let nextExpiry = Infinity;
+    while (true) {
+      const rows = await this.storage.list({ prefix: 'fail:', limit: 128, ...(startAfter ? { startAfter } : {}) });
+      if (!rows.size) break;
+      const expired = [];
+      for (const [key, row] of rows) {
+        startAfter = key;
+        if (row.expires <= now) expired.push(key);
+        else nextExpiry = Math.min(nextExpiry, row.expires);
+      }
+      if (expired.length) await this.storage.delete(expired);
+    }
+    if (nextExpiry !== Infinity) await this.storage.setAlarm(nextExpiry);
   }
 
   async #handle(request) {
@@ -165,6 +193,7 @@ export class SetupStore {
       const { ip, match } = await request.json();
       const key = `fail:${String(ip || '').slice(0, 128)}`;
       const now = Date.now();
+      if (await this.storage.getAlarm() === null) await this.storage.setAlarm(now + SETUP_FAILURE_WINDOW_MS);
       const row = await this.storage.get(key);
       const active = row && row.expires > now ? row : null;
       if (active && active.count >= SETUP_FAILURE_LIMIT) {
@@ -175,7 +204,7 @@ export class SetupStore {
         });
       }
       if (match === true) {
-        if (active) await this.storage.delete(key);
+        if (row) await this.storage.delete(key);
         return Response.json({ ok: true, limited: false });
       }
       const count = (active?.count || 0) + 1;
@@ -187,10 +216,18 @@ export class SetupStore {
       const value = await this.storage.get('config');
       return Response.json({ value: value || null });
     }
-    if (request.method === 'PUT' && pathname === '/config') {
+    if ((request.method === 'PUT' && pathname === '/config') || (request.method === 'POST' && pathname === '/activate')) {
       const body = await request.json();
-      await this.storage.put('config', sanitizeConfig(body.value));
-      return Response.json({ ok: true });
+      const current = await this.storage.get('config');
+      if ((body.expectedRevision || '') !== (current?.revision || '')) {
+        return Response.json({ error: 'Setup changed in another tab. Reload status and use the latest configuration.' }, { status: 409 });
+      }
+      if (pathname === '/activate' && (!current?.complete || !current.turnstileSecret)) {
+        return Response.json({ error: 'Prepare Cloudflare and install the Ghost snippet before activating.' }, { status: 400 });
+      }
+      const value = sanitizeConfig(pathname === '/activate' ? { ...current, turnstileEnabled: true } : body.value);
+      await this.storage.put('config', value);
+      return Response.json({ value });
     }
     return new Response('Not Found', { status: 404 });
   }
@@ -218,9 +255,11 @@ async function readConfig(env) {
   return body?.value || null;
 }
 
-async function writeConfig(env, value) {
-  const res = await storeFetch(env, '/config', { method: 'PUT', body: JSON.stringify({ value }) });
+async function writeConfig(env, value, expectedRevision) {
+  const res = await storeFetch(env, '/config', { method: 'PUT', body: JSON.stringify({ value, expectedRevision }) });
+  if (res.status === 409) throw httpError((await res.json()).error, 409);
   if (!res.ok) throw httpError('Fix: setup storage could not be saved. Deploy the current wrangler.toml and run setup again.', 503);
+  return (await res.json()).value;
 }
 
 async function expectedToken(env) {
@@ -237,7 +276,7 @@ async function expectedToken(env) {
 
 async function authorize(request, env, provided, expected) {
   const match = await tokensMatch(String(provided || '').slice(0, 4096), expected);
-  const ipHash = await digest(request.headers.get('CF-Connecting-IP') || 'unknown');
+  const ipHash = await digest(ipBucket(request.headers.get('CF-Connecting-IP') || 'unknown'));
   const res = await storeFetch(env, '/gate', { method: 'POST', body: JSON.stringify({ ip: ipHash, match }) });
   if (!res.ok) throw httpError('Fix: setup storage is unavailable. Try again shortly.', 503);
   const gate = await res.json();
@@ -393,6 +432,7 @@ function renderGhostSteps(config) {
     <p>${active ? 'Turnstile signup protection is active.' : 'Turnstile is waiting for activation. IP and email quotas and the confirmation page are already active.'}</p>
     ${active ? '' : `<form method="post" action="/ghost-guard/setup" autocomplete="off">
       <input type="hidden" name="intent" value="activate">
+      <input type="hidden" name="config_revision" value="${escapeHtml(config.revision || '')}">
       <label class="check"><input name="snippet_installed" type="checkbox" required> I saved the snippet in Ghost Site Header.</label>
       <label for="activation_token">Setup token</label>
       <input id="activation_token" name="setup_token" type="password" required maxlength="256" autocomplete="current-password">
@@ -468,16 +508,17 @@ export async function handleSetup(request, env) {
     const provided = String(form.get('setup_token') || '');
     secrets.push(provided);
     await authorize(request, env, provided, tokenInfo.token);
-    const config = await readConfig(env);
     const intent = String(form.get('intent') || '');
     if (intent === 'activate') {
-      if (!config?.complete || !config.turnstileSecret || form.get('snippet_installed') !== 'on') {
+      if (form.get('snippet_installed') !== 'on') {
         throw httpError('Save the Cloudflare configuration and install the Ghost snippet before activating.', 400);
       }
-      const active = { ...config, turnstileEnabled: true };
-      await writeConfig(env, active);
-      return htmlResponse(200, renderStatus(active));
+      const res = await storeFetch(env, '/activate', { method: 'POST', body: JSON.stringify({ expectedRevision: String(form.get('config_revision') || '') }) });
+      const body = await res.json();
+      if (!res.ok) throw httpError(body.error || 'Activation could not be saved. Try again.', res.status);
+      return htmlResponse(200, renderStatus(body.value));
     }
+    const config = await readConfig(env);
     const ghostUrl = String(form.get('ghost_url') || '').trim();
     if (intent === 'view' || (!ghostUrl && config?.complete && intent !== 'run')) {
       return htmlResponse(200, renderStatus(config));
@@ -582,6 +623,27 @@ function domainsInclude(widget, hostname) {
   return (widget.domains || []).map((domain) => String(domain).toLowerCase()).includes(hostname);
 }
 
+// Routes only support a leading host wildcard and a trailing path wildcard.
+// Compare paths ignoring case/repeated slashes to cover every Ghost alias.
+export function conflictingRoutes(routes, hostname, basePath, scriptName) {
+  const targets = [`${basePath}/members`, `${basePath}/members/api/send-magic-link`, '/ghost-guard/setup', '/ghost-guard/turnstile.js', '/signup-shield/webhooks/member-added'];
+  return routes.filter((route) => {
+    if (route.script === scriptName || String(route.pattern).toLowerCase() === `${hostname}/*`) return false;
+    const match = String(route.pattern).match(/^(?:https?:\/\/)?([^/]+)(\/.*)?$/i);
+    if (!match) return false;
+    const host = match[1].toLowerCase();
+    if (host.startsWith('*') ? !hostname.endsWith(host.slice(1)) : host !== hostname) return false;
+    const rawPath = match[2] || '/';
+    const wildcard = rawPath.endsWith('*');
+    const path = (wildcard ? rawPath.slice(0, -1) : rawPath).replace(/\/{2,}/g, '/').toLowerCase();
+    // An exact-host route overrides a less-specific, whole-host wildcard.
+    if (host !== hostname && wildcard && path === '/') return false;
+    return targets.some((target) => wildcard
+      ? target.startsWith(path) || `${target}/`.startsWith(path)
+      : path.replace(/\/+$/, '') === target);
+  });
+}
+
 async function listWidgets(token, accountId) {
   const widgets = [];
   for (let page = 1; page <= 20; page++) {
@@ -661,7 +723,10 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
   if (!await run('Worker route', async () => {
     const pattern = `${ctx.hostname}/*`;
     const data = await cfFetch(cfToken, `https://api.cloudflare.com/client/v4/zones/${ctx.zoneId}/workers/routes`);
-    const existing = (data.result || []).find((route) => route.pattern === pattern);
+    const routes = data.result || [];
+    const conflicts = conflictingRoutes(routes, ctx.hostname, ctx.ghostBasePath, scriptName);
+    if (conflicts.length) throw httpError(`Fix: conflicting Cloudflare routes can bypass protection: ${conflicts.map((route) => route.pattern).join(', ')}. Remove those routes or assign them to ${scriptName}, then run setup again.`, 409);
+    const existing = routes.find((route) => route.pattern.toLowerCase() === pattern);
     if (existing?.script === scriptName) return `Route ${pattern} is already attached to ${scriptName}.`;
     if (existing?.script) throw httpError(`Fix: ${pattern} already points at ${existing.script}. Point it at ${scriptName}, or remove it, then run setup again.`, 409);
     if (existing) {
@@ -723,9 +788,9 @@ async function runSetup({ request, env, values, cfToken, adminKey, secrets }) {
   })) return { steps, checks: [], secrets, values, ok: false };
 
   const checks = await runChecks(ctx);
-  const config = { ...persisted(), complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
+  let config = { ...persisted(), complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
   if (!await run('Save configuration', async () => {
-    await writeConfig(env, config);
+    config = await writeConfig(env, config, previous?.revision || '');
     return 'Settings are saved in this Worker’s setup store. Install the Ghost snippet, then activate signup protection.';
   })) return { steps, checks, secrets, values, ok: false };
   return { steps, checks, secrets, values, ok: true, config };

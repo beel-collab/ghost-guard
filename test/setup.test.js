@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
 import {
-  SetupStore, SETUP_FAILURE_LIMIT, codeInjectionSnippet, mergeConfig, GUARD_START, GUARD_END,
+  SetupStore, SETUP_FAILURE_LIMIT, codeInjectionSnippet, conflictingRoutes, mergeConfig, GUARD_START, GUARD_END,
 } from '../src/setup.js';
 
 const ZONE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -19,15 +19,21 @@ const CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; 
 
 function memoryStore() {
   const data = new Map();
-  const store = new SetupStore({
-    storage: {
-      async get(key) { return data.get(key); },
-      async put(key, value) { data.set(key, value); },
-      async delete(key) { data.delete(key); },
+  const storage = {
+    alarm: null,
+    async get(key) { return data.get(key); },
+    async put(key, value) { data.set(key, value); },
+    async delete(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) data.delete(key); },
+    async getAlarm() { return storage.alarm; },
+    async setAlarm(time) { storage.alarm = time; },
+    async list({ prefix, startAfter = '', limit }) {
+      return new Map([...data].filter(([key]) => key.startsWith(prefix) && key > startAfter).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit));
     },
-  });
+  };
+  const store = new SetupStore({ storage });
   return {
-    data,
+    data, storage,
+    fire() { storage.alarm = null; return store.alarm(); },
     SETUP_STORE: {
       idFromName(name) { return name; },
       get() { return { fetch: (input, init) => store.fetch(new Request(input, init)) }; },
@@ -227,7 +233,7 @@ test('setup prepares Cloudflare without Ghost writes or Worker secret deployment
   const unauthorized = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'activate',snippet_installed:'on'}, {token:'wrong'}), env);
   assert.equal(unauthorized.status, 401);
   assert.equal(store.data.get('config').turnstileEnabled, false);
-  const activated = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'activate',snippet_installed:'on'}), env);
+  const activated = await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
   assert.match(await activated.text(), /Turnstile signup protection is active/);
   assert.equal(store.data.get('config').turnstileEnabled, true);
   const blocked = await worker.fetch(signup(), env);
@@ -242,6 +248,106 @@ test('setup prepares Cloudflare without Ghost writes or Worker secret deployment
   assert.doesNotMatch(gateHtml, /data-sitekey|Route reachable/);
   const status = await worker.fetch(formRequest('/ghost-guard/setup', {intent:'view'}), env);
   assert.match(await status.text(), /Install the Ghost snippet/);
+});
+
+function activationFields(store) {
+  return { intent: 'activate', snippet_installed: 'on', config_revision: store.data.get('config').revision };
+}
+
+test('stale activation forms cannot enable a replacement widget', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  const first = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const oldForm = activationFields(store);
+  assert.match(await first.text(), new RegExp(`name="config_revision" value="${oldForm.config_revision}"`));
+  state.widgets[0].sitekey = 'NEW-SITEKEY';
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const stale = await worker.fetch(formRequest('/ghost-guard/setup', oldForm), env);
+  assert.equal(stale.status, 409);
+  assert.match(await stale.text(), /Setup changed in another tab/);
+  assert.equal(store.data.get('config').turnstileEnabled, false);
+  assert.equal(store.data.get('config').turnstileSitekey, 'NEW-SITEKEY');
+  const results = await Promise.all(Array.from({ length: 2 }, () => worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env)));
+  assert.deepEqual(results.map(res => res.status).sort(), [200, 409]);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+});
+
+test('an overlapping preparation cannot overwrite a successful activation', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const originalFetch = globalThis.fetch;
+  let release, reached;
+  const hold = new Promise(resolve => { release = resolve; });
+  const paused = new Promise(resolve => { reached = resolve; });
+  t.after(() => release());
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    if (new URL(input).pathname === '/ghost-guard/turnstile.js') { reached(); await hold; }
+    return originalFetch(input, init);
+  });
+  const pending = worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await paused;
+  assert.equal((await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env)).status, 200);
+  const activeRevision = store.data.get('config').revision;
+  release();
+  assert.match(await (await pending).text(), /Setup changed in another tab/);
+  assert.equal(store.data.get('config').revision, activeRevision);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+});
+
+test('setup refuses overlapping Cloudflare exclusions even when the hostname route already exists', async (t) => {
+  for (const pattern of ['example.com/blog/Members*', 'https://example.com/blog//Members/API/Send-Magic-Link/', 'example.com/ghost-guard/turnstile.js', '*example.com/blog/Members*']) {
+    const state = world();
+    state.routes.push({ id: 'bypass', pattern, script: null });
+    state.routes.push({ id: 'main', pattern: 'example.com/*', script: 'ghost-guard' });
+    install(t, state);
+    const store = memoryStore();
+    const response = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store));
+    assert.match(await response.text(), /conflicting Cloudflare routes can bypass protection/);
+    assert.equal(store.data.has('config'), false);
+    assert.equal(state.widgetPosts, 0);
+    assert.equal(state.routePosts, 0);
+  }
+});
+
+test('route conflicts cover root installs and schemes but allow unrelated apps and wider host routes', () => {
+  const route = (pattern, script = null) => ({ pattern, script });
+  const blocked = [route('example.com/Members*'), route('http://example.com/*', 'another-worker'), route('example.com/MEMBERS/API/SEND-MAGIC-LINK')];
+  assert.deepEqual(conflictingRoutes(blocked, 'example.com', '', 'ghost-guard'), blocked);
+  const allowed = [route('*.example.com/Members*'), route('other.example.com/Members*'), route('*example.com/*', 'another-worker'), route('example.com/assets/*'), route('example.com/blog/Members*', 'ghost-guard')];
+  assert.deepEqual(conflictingRoutes(allowed, 'example.com', '/blog', 'ghost-guard'), []);
+  assert.equal(conflictingRoutes([route('*.example.com/blog/Members*')], 'www.example.com', '/blog', 'ghost-guard').length, 1);
+});
+
+test('setup password attempts share an IPv6 /64 quota', async () => {
+  const store = memoryStore(), env = baseEnv(store);
+  for (let i = 1; i <= SETUP_FAILURE_LIMIT; i++) {
+    assert.equal((await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'view' }, { token: 'wrong', ip: `2001:db8:1234:5678::${i}` }), env)).status, 401);
+  }
+  assert.equal((await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'view' }, { ip: '2001:db8:1234:5678::99' }), env)).status, 429);
+  assert.equal((await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'view' }, { ip: '2001:db8:1234:5679::1' }), env)).status, 200);
+  assert.equal([...store.data.keys()].filter(key => key.startsWith('fail:')).length, 1);
+});
+
+test('setup alarms sweep expired login records in batches without deleting config or live limits', async () => {
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', { intent: 'view' }, { token: 'wrong' }), env);
+  assert.ok(store.storage.alarm > Date.now());
+  const deadline = Date.now() + 30_000;
+  store.data.clear();
+  store.data.set('config', { revision: 'keep' });
+  store.data.set('setupToken', 'keep');
+  for (let i = 0; i < 300; i++) store.data.set(`fail:${String(i).padStart(4, '0')}`, { count: 1, expires: Date.now() - 1 });
+  store.data.set('fail:live', { count: 8, expires: deadline });
+  await store.fire();
+  assert.deepEqual([...store.data.keys()].sort(), ['config', 'fail:live', 'setupToken']);
+  assert.equal(store.storage.alarm, deadline);
+  store.data.get('fail:live').expires = Date.now() - 1;
+  await store.fire();
+  assert.equal(store.data.has('fail:live'), false);
+  assert.equal(store.storage.alarm, null);
 });
 
 test('signup-only setup needs no Ghost credentials; disabling the labeller clears its stored credentials', async (t) => {

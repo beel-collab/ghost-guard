@@ -349,7 +349,11 @@ async function verifyTurnstile(token, env, request) {
 }
 
 function htmlHeaders() {
-  return pageHeaders();
+  const headers = pageHeaders();
+  // Ghost may redirect a successful confirmation to an external welcome page.
+  // Chromium also checks form-action on that redirect after consuming the token.
+  headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+  return headers;
 }
 
 function escapeHtml(value) {

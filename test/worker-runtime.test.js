@@ -98,7 +98,7 @@ test('Wrangler runtime serves assets and atomically enforces Durable Object quot
 
 // The alarm logic assumes getAlarm() is null inside the running alarm unless a
 // newer delivery set one. Exercise a real failure and retry in workerd.
-test('Wrangler runtime retries a failed webhook labelling from the Durable Object alarm', { timeout: 60000 }, async (t) => {
+test('Wrangler runtime protects setup revisions, expires login records, and retries webhook labelling', { timeout: 60000 }, async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'ghost-guard-retry-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   process.env.XDG_CONFIG_HOME = temp;
@@ -138,15 +138,38 @@ test('Wrangler runtime retries a failed webhook labelling from the Durable Objec
   const src = new URL('../src/', import.meta.url);
   const entry = join(temp, 'fast-retry-worker.js');
   await writeFile(entry, `
-    import worker, { SignupRateLimiter, MemberLabeller, SetupStore } from ${JSON.stringify(fileURLToPath(new URL('worker.js', src)))};
+    import worker, { SignupRateLimiter, MemberLabeller, SetupStore as BaseSetupStore } from ${JSON.stringify(fileURLToPath(new URL('worker.js', src)))};
     import { RETRY_DELAYS_MS } from ${JSON.stringify(fileURLToPath(new URL('webhook.js', src)))};
     RETRY_DELAYS_MS.splice(0, RETRY_DELAYS_MS.length, 200, 200);
-    export { SignupRateLimiter, MemberLabeller, SetupStore };
+    export { SignupRateLimiter, MemberLabeller };
+    export class SetupStore extends BaseSetupStore {
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === '/__test/expire-login') {
+          await this.storage.put('setupToken', 'keep-token');
+          await this.storage.put('fail:expired', {count:1,expires:Date.now()-1});
+          await this.storage.put('fail:live', {count:8,expires:Date.now()+60000});
+          await this.storage.setAlarm(Date.now());
+          return Response.json({ok:true});
+        }
+        if (path === '/__test/storage') {
+          return Response.json({
+            failures:[...(await this.storage.list({prefix:'fail:'})).keys()],
+            revision:(await this.storage.get('config')).revision,
+            token:await this.storage.get('setupToken'),
+          });
+        }
+        return super.fetch(request);
+      }
+    }
     export default {
       fetch(request, env) {
-        if (new URL(request.url).pathname === '/__test/config') {
+        const path = new URL(request.url).pathname;
+        if (path.startsWith('/__test/')) {
           const store = env.SETUP_STORE.get(env.SETUP_STORE.idFromName('setup'));
-          return store.fetch('https://setup-store/config', {method:'PUT',body:request.body});
+          return store.fetch('https://setup-store' + (path === '/__test/config' ? '/config' : path), {
+            method:path === '/__test/config' ? 'PUT' : request.method, body:request.body,
+          });
         }
         return worker.fetch(request, env);
       },
@@ -158,6 +181,7 @@ test('Wrangler runtime retries a failed webhook labelling from the Durable Objec
     local: true, persist: false, logLevel: 'error',
     vars: {
       GHOST_ORIGIN: adminUrl, CLEANUP_ENABLED: 'false', ADMIN_API_URL: '',
+      SETUP_TOKEN: 'runtime-setup-token',
     },
     experimental: { disableExperimentalWarning: true, disableDevRegistry: true, watch: false },
   });
@@ -168,12 +192,40 @@ test('Wrangler runtime retries a failed webhook labelling from the Durable Objec
   const seeded = await dev.fetch('/__test/config', {
     method:'PUT', headers:{'content-type':'application/json'},
     body:JSON.stringify({value:{
+      complete:true, hostname:'example.com',
+      turnstileSecret:'runtime-turnstile-secret', turnstileSitekey:'runtime-public-key', turnstileEnabled:false,
       webhookEnabled:true, adminApiUrl:adminUrl,
       adminApiKey:'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4),
       webhookSecret:'webhook-secret',
     }}),
   });
   assert.equal(seeded.status,200);
+  const prepared = (await seeded.json()).value;
+  const activation = {
+    intent:'activate', snippet_installed:'on',
+    setup_token:'runtime-setup-token', config_revision:prepared.revision,
+  };
+  const activated = await Promise.all(Array.from({length:2}, () => dev.fetch('/ghost-guard/setup', {
+    method:'POST', headers:{'content-type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams(activation),
+  })));
+  assert.deepEqual(activated.map(response => response.status).sort(), [200,409]);
+  const staleSave = await dev.fetch('/__test/config', {
+    method:'PUT', headers:{'content-type':'application/json'},
+    body:JSON.stringify({value:prepared,expectedRevision:prepared.revision}),
+  });
+  assert.equal(staleSave.status,409);
+  assert.equal((await dev.fetch('/__test/expire-login', {method:'POST'})).status,200);
+  let saved;
+  const sweepDeadline = Date.now() + 5000;
+  do {
+    saved = await (await dev.fetch('/__test/storage')).json();
+    if (!saved.failures.includes('fail:expired')) break;
+    await new Promise(resolve => setTimeout(resolve,50));
+  } while (Date.now() < sweepDeadline);
+  assert.deepEqual(saved.failures,['fail:live']);
+  assert.notEqual(saved.revision,prepared.revision);
+  assert.equal(saved.token,'keep-token');
 
   const body = JSON.stringify({ member: { current: { id: memberId, email: 'reader@work.example' } } });
   const timestamp = String(Date.now());

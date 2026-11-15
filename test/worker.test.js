@@ -137,13 +137,25 @@ test('all signup confirmation pages require a form POST and have no script or au
     assert.match(html, /Confirm signup/);
     assert.doesNotMatch(html, /<script|turnstile|onload=|\.submit\(|requestSubmit|http-equiv="refresh"/i);
     assert.equal(response.headers.get('cache-control'), 'no-store, no-cache, must-revalidate');
-    assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'");
+    assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
     assert.equal(response.headers.get('x-frame-options'), 'DENY');
     const head = await worker.fetch(new Request(url, { method: 'HEAD' }), envFor());
     assert.equal(head.status, 200);
     assert.equal(await head.text(), '');
   }
   assert.equal(calls.origin.length, 0);
+});
+
+test('confirmation preserves external Ghost welcome redirects and omits form-action', async (t) => {
+  const welcome = 'https://welcome.example/thanks/';
+  t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 302, headers: { Location: welcome, 'Set-Cookie': 'ghost-members=session; Secure; HttpOnly' } }));
+  const url = 'https://blog.example/members/?token=abc&action=signup';
+  const page = await worker.fetch(new Request(url), envFor());
+  assert.doesNotMatch(page.headers.get('content-security-policy'), /form-action/);
+  const confirmed = await worker.fetch(new Request(url, { method: 'POST', body: new URLSearchParams({ token: 'abc', action: 'signup' }) }), envFor());
+  assert.equal(confirmed.status, 302);
+  assert.equal(confirmed.headers.get('location'), welcome);
+  assert.match(confirmed.headers.get('set-cookie'), /ghost-members=session/);
 });
 
 test('confirmation POST and signin magic links do not need Turnstile', async (t) => {
