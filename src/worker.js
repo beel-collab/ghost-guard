@@ -14,7 +14,8 @@ import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.
 export { SignupRateLimiter } from './rate-limit.js';
 import { handleMemberAddedWebhook } from './webhook.js';
 export { MemberLabeller } from './webhook.js';
-import { escapeHtml, handleSetup, pageHeaders, withStoredConfig } from './setup.js';
+import { escapeHtml, handleSetup, pageHeaders } from './setup.js';
+import { withStoredConfig } from './config.js';
 export { SetupStore } from './setup.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';

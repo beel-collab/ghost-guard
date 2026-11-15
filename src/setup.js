@@ -4,6 +4,7 @@
  */
 import { ADMIN_KEY_PATTERN } from './webhook.js';
 import { ipBucket } from './rate-limit.js';
+import { forgetStoredConfig, readStoredConfig } from './config.js';
 
 export const GUARD_START = '<!-- ghost-guard:start -->';
 export const GUARD_END = '<!-- ghost-guard:end -->';
@@ -13,6 +14,7 @@ export const SETUP_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const WIDGET_MODE = 'managed';
 const MAX_WEBHOOK_SECRET_LENGTH = 191;
 const MAX_SETUP_BODY_BYTES = 64 * 1024;
+const TURNSTILE_CHECK = 'Turnstile widget';
 
 export function pageHeaders() {
   return {
@@ -27,38 +29,6 @@ export function pageHeaders() {
 
 function nonempty(value) {
   return typeof value === 'string' && value.length > 0;
-}
-
-export function mergeConfig(env, stored) {
-  if (!stored || typeof stored !== 'object') return env;
-  const next = { ...env };
-  // A prepared widget takes over only once activated. Until then a manually
-  // configured TURNSTILE_SECRET (if any) keeps protecting signups.
-  if (Object.hasOwn(stored, 'turnstileSecret') && stored.turnstileEnabled !== false) {
-    next.TURNSTILE_SECRET = stored.turnstileSecret;
-    next.TURNSTILE_HOSTNAME = stored.hostname || '';
-  }
-  if (Object.hasOwn(stored, 'ghostBasePath')) next.GHOST_BASE_PATH = stored.ghostBasePath;
-  // Setup owns the labeller only once it enabled or explicitly turned it off.
-  // A run that left it alone keeps a manually configured labeller working.
-  if (stored.cleanupEnabled === 'true' || stored.labellerDisabled === true) {
-    next.CLEANUP_ENABLED = stored.cleanupEnabled;
-    next.WEBHOOK_SECRET = stored.webhookSecret || '';
-    next.ADMIN_API_KEY = stored.adminApiKey || '';
-    next.ADMIN_API_URL = stored.adminApiUrl || '';
-  }
-  return next;
-}
-
-export async function withStoredConfig(env) {
-  if (!env?.SETUP_STORE) return env;
-  try {
-    return mergeConfig(env, await readConfig(env));
-  } catch {
-    const error = new Error('Setup configuration is temporarily unavailable. Please try again later.');
-    error.code = 'SETUP_CONFIG_UNAVAILABLE';
-    throw error;
-  }
 }
 
 export function escapeHtml(value) {
@@ -189,13 +159,11 @@ export class SetupStore {
     const { pathname } = url;
     if (request.method === 'POST' && pathname === '/token') {
       let token = await this.storage.get('setupToken');
-      let created = false;
       if (typeof token !== 'string' || !token) {
         token = randomToken();
         await this.storage.put('setupToken', token);
-        created = true;
       }
-      return Response.json({ token, created });
+      return Response.json({ token });
     }
     if (request.method === 'POST' && pathname === '/gate') {
       const { ip, match } = await request.json();
@@ -243,6 +211,10 @@ export class SetupStore {
       if (pathname === '/activate' && (!current?.complete || !current.turnstileSecret)) {
         return Response.json({ error: 'Prepare Cloudflare and install the Ghost snippet before activating.' }, { status: 400 });
       }
+      // Activating a secret Turnstile rejected would fail every signup.
+      if (pathname === '/activate' && !current.checklist?.some((item) => item.title === TURNSTILE_CHECK && item.ok)) {
+        return Response.json({ error: 'Fix: the last setup run could not confirm the Turnstile widget. Run setup again, then activate.' }, { status: 400 });
+      }
       const value = sanitizeConfig(pathname === '/activate' ? { ...current, turnstileEnabled: true } : body.value);
       await this.storage.put('config', value);
       return Response.json({ value });
@@ -266,17 +238,15 @@ async function storeFetch(env, pathname, init) {
   }));
 }
 
-async function readConfig(env) {
-  const res = await storeFetch(env, '/config');
-  if (!res.ok) throw new Error('setup store unavailable');
-  const body = await res.json();
-  return body?.value || null;
+function readConfig(env) {
+  return readStoredConfig(env);
 }
 
 async function writeConfig(env, value, expectedRevision) {
   const res = await storeFetch(env, '/config', { method: 'PUT', body: JSON.stringify({ value, expectedRevision }) });
   if (res.status === 409) throw httpError((await res.json()).error, 409);
   if (!res.ok) throw httpError('Fix: setup storage could not be saved. Deploy the current wrangler.toml and run setup again.', 503);
+  forgetStoredConfig(env);
   return (await res.json()).value;
 }
 
@@ -299,9 +269,9 @@ async function expectedToken(env) {
   const res = await storeFetch(env, '/token', { method: 'POST' });
   if (!res.ok) throw httpError('Fix: the setup token could not be stored. Deploy the current wrangler.toml and try again.', 503);
   const body = await res.json();
-  if (body.created) {
-    console.log(`ghost-guard: SETUP_TOKEN is not set. A setup token was generated and stored. Token: ${body.token}. Enter it at /ghost-guard/setup. It is not shown on the setup page. To set your own, run: npx wrangler secret put SETUP_TOKEN`);
-  }
+  // Logged on every setup request, not only when created: the operator often
+  // starts `wrangler tail` after the first visit. Worker logs are owner-only.
+  console.log(`ghost-guard: SETUP_TOKEN is not set. Setup token: ${body.token}. Enter it at /ghost-guard/setup. It is not shown on the setup page. To set your own, run: npx wrangler secret put SETUP_TOKEN`);
   return { token: body.token, source: 'stored' };
 }
 
@@ -392,7 +362,7 @@ function layout(title, body) {
 
 function generatedNote(generated) {
   if (!generated) return '<p class="hint">Enter the SETUP_TOKEN for this Worker.</p>';
-  return '<p class="hint">No SETUP_TOKEN is set. A token was written to this Worker\'s logs only. Run <code>npx wrangler tail</code> or open the dashboard logs, then enter it here. To choose your own: <code>npx wrangler secret put SETUP_TOKEN</code>.</p>';
+  return '<p class="hint">No SETUP_TOKEN is set. A generated token is written to this Worker\'s logs, not this page. Run <code>npx wrangler tail</code>, reload this page, and copy the token from the log line. To choose your own: <code>npx wrangler secret put SETUP_TOKEN</code>.</p>';
 }
 
 function renderMessage(message) {
@@ -589,6 +559,7 @@ export async function handleSetup(request, env) {
       const res = await storeFetch(env, '/activate', { method: 'POST', body: JSON.stringify({ expectedRevision: String(form.get('config_revision') || '') }) });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw httpError(body.error || 'Activation could not be saved. Try again.', res.status >= 500 ? 503 : res.status);
+      forgetStoredConfig(env);
       return htmlResponse(200, renderStatus(body.value));
     }
     const config = await readConfig(env);
@@ -938,7 +909,7 @@ async function checkRoute(ctx) {
 }
 
 async function checkTurnstile(ctx) {
-  const title = 'Turnstile widget';
+  const title = TURNSTILE_CHECK;
   try {
     const body = new URLSearchParams();
     body.set('secret', ctx.turnstileSecret);

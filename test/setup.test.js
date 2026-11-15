@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { MemoryRateLimiter } from '../src/rate-limit.js';
 import {
-  SetupStore, SETUP_FAILURE_LIMIT, codeInjectionSnippet, conflictingRoutes, mergeConfig, GUARD_START, GUARD_END,
+  SetupStore, SETUP_FAILURE_LIMIT, codeInjectionSnippet, conflictingRoutes, GUARD_START, GUARD_END,
 } from '../src/setup.js';
+import { mergeConfig } from '../src/config.js';
 
 const ZONE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const ACCOUNT = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -199,7 +200,7 @@ test('setup stays locked without a valid token and rate-limits failures', async 
   assert.equal(state.calls.length, 0);
 });
 
-test('a generated setup token is logged once and never written into the page', async (t) => {
+test('a generated setup token is logged on every visit and never written into the page', async (t) => {
   const logs = [];
   t.mock.method(console, 'log', (...args) => logs.push(args.join(' ')));
   const store = memoryStore();
@@ -207,12 +208,14 @@ test('a generated setup token is logged once and never written into the page', a
   const first = await worker.fetch(new Request('https://blog.example/ghost-guard/setup'), env);
   const html = await first.text();
   assert.match(logs[0], /npx wrangler secret put SETUP_TOKEN/);
-  const token = logs[0].match(/Token: ([a-f0-9]{64})/)?.[1];
+  const token = logs[0].match(/Setup token: ([a-f0-9]{64})/)?.[1];
   assert.ok(token);
   assert.equal(html.includes(token), false);
   assert.match(html, /wrangler tail/);
+  // An operator who starts `wrangler tail` after the first visit still sees it.
   await worker.fetch(new Request('https://blog.example/ghost-guard/setup'), env);
-  assert.equal(logs.length, 1);
+  assert.equal(logs.length, 2);
+  assert.ok(logs[1].includes(token));
 });
 
 
@@ -671,4 +674,72 @@ test('setup cancels a chunked body as soon as it exceeds the limit', async () =>
   assert.equal(response.status, 400);
   assert.equal(cancelled, true);
   assert.ok(pulls < 100);
+});
+
+test('a failed widget-secret read stops setup instead of rotating a secret it could not keep', async (t) => {
+  const state = world();
+  // The listed widget has no secret, so setup would otherwise fall back to rotation.
+  state.widgets.push({ sitekey: SITEKEY, name: 'ghost-guard-example.com', domains: ['example.com'] });
+  install(t, state);
+  const store = memoryStore();
+  const inner = store.SETUP_STORE.get();
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() {
+      return {
+        // storeFetch passes a Request; read its URL without consuming the body.
+        fetch: (request) => request.method === 'GET' && new URL(request.url).pathname === '/widget-secret'
+          ? new Response('unavailable', { status: 500 })
+          : inner.fetch(request),
+      };
+    },
+  };
+  const res = await worker.fetch(formRequest('/ghost-guard/setup', happyFields), baseEnv(store, { SETUP_STORE }));
+  assert.match(await res.text(), /setup storage is unavailable/);
+  assert.equal(state.rotations || 0, 0);
+  assert.equal(store.data.has('config'), false);
+});
+
+test('activation is refused when the last run could not confirm the Turnstile widget', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  const config = store.data.get('config');
+  config.checklist = config.checklist.map((item) => item.title === 'Turnstile widget' ? { ...item, ok: false } : item);
+  const refused = await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  assert.equal(refused.status, 400);
+  assert.match(await refused.text(), /could not confirm the Turnstile widget/);
+  assert.equal(store.data.get('config').turnstileEnabled, false);
+});
+
+test('signups reuse this isolate’s copy of stored settings until setup saves', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore();
+  const inner = store.SETUP_STORE.get();
+  let reads = 0;
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() {
+      return {
+        fetch: (request) => {
+          if (request.method === 'GET' && new URL(request.url).pathname === '/config') reads++;
+          return inner.fetch(request);
+        },
+      };
+    },
+  };
+  const env = baseEnv(store, { SETUP_STORE });
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  t.mock.method(globalThis, 'fetch', async (input) => String(input?.url || input).includes('siteverify')
+    ? Response.json({ success: false })
+    : new Response('origin'));
+  for (let i = 0; i < 3; i++) await worker.fetch(new Request('https://example.com/blog/post/'), env);
+  const afterPages = reads;
+  for (let i = 0; i < 3; i++) await worker.fetch(new Request('https://example.com/blog/post/'), env);
+  assert.equal(reads, afterPages);
+  // Activation in this isolate takes effect on the next signup, not after the cache expires.
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  assert.equal((await worker.fetch(signup(), env)).status, 400);
 });

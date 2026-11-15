@@ -197,6 +197,7 @@ test('Wrangler runtime protects setup revisions, expires login records, and retr
       webhookEnabled:true, adminApiUrl:adminUrl,
       adminApiKey:'aaaaaaaaaaaaaaaaaaaaaaaa:' + '0123456789abcdef'.repeat(4),
       webhookSecret:'webhook-secret',
+      checklist:[{title:'Turnstile widget',ok:true,detail:'accepted'}],
     }}),
   });
   assert.equal(seeded.status,200);
