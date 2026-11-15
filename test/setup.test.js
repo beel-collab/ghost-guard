@@ -822,3 +822,27 @@ test('after setup completes, a generated token is explained without being logged
   assert.match(gate, /wrangler secret put SETUP_TOKEN/);
   assert.equal(logs.length, 1);
 });
+
+test('a siteverify outage does not carry verification to a widget that was never activated', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  assert.equal(store.data.get('config').turnstileVerified, true);
+  state.turnstileDown = true;
+  const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
+  assert.equal(store.data.get('config').turnstileVerified, false);
+  assert.doesNotMatch(rerun, /Activate signup protection/);
+});
+
+test('a rerun that switches active Turnstile off says so', async (t) => {
+  const state = world();
+  install(t, state);
+  t.mock.method(console, 'warn', () => {});
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  state.turnstileRejects = true;
+  const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
+  assert.match(rerun, /Turnstile protection is now switched off/);
+});

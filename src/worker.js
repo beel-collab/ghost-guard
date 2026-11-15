@@ -21,6 +21,7 @@ export { SetupStore } from './setup.js';
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
 const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
 const WEBHOOK_REFRESH_MS = 5_000;
+const webhookRefreshes = new WeakMap();
 
 export default {
   async fetch(request, env) {
@@ -72,14 +73,24 @@ async function handleRequest(request, env) {
   }
 
   if (url.pathname === '/signup-shield/webhooks/member-added') {
-    // Ghost never retries a delivery. If the cached secret rejects it, setup
-    // may have just changed the secret in another isolate: retry once against
-    // settings at most WEBHOOK_REFRESH_MS old. An unsigned flood therefore
-    // costs at most one store read per isolate per window.
+    // Ghost never retries a delivery. If the cached settings reject it (bad
+    // secret, labeller off, missing credentials), setup may have just changed
+    // them in another isolate: retry once against settings at most
+    // WEBHOOK_REFRESH_MS old. Refresh attempts, failed or not, are limited to
+    // one per isolate per window, so an unsigned flood cannot hammer the store.
     const retry = env.SETUP_STORE ? request.clone() : null;
     const response = await handleMemberAddedWebhook(request, await config());
-    if (response.status !== 401 || !retry) return response;
-    return handleMemberAddedWebhook(retry, await withStoredConfig(env, { maxAge: WEBHOOK_REFRESH_MS }));
+    if (![401, 503].includes(response.status) || !retry) return response;
+    const last = webhookRefreshes.get(env.SETUP_STORE) || 0;
+    if (Date.now() - last < WEBHOOK_REFRESH_MS) return response;
+    webhookRefreshes.set(env.SETUP_STORE, Date.now());
+    let latest;
+    try {
+      latest = await withStoredConfig(env, { maxAge: WEBHOOK_REFRESH_MS });
+    } catch {
+      return response;
+    }
+    return handleMemberAddedWebhook(retry, latest);
   }
 
   if (path.endsWith('/members') && url.searchParams.has('token')) {

@@ -860,11 +860,20 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   // Only an explicit rejection of the secret demotes a widget. A siteverify
   // outage keeps the previous state for the same widget: turning an active
   // widget off would leave signups without Turnstile.
+  // Only an already-active widget with the same secret is carried over.
   const saved = persisted();
   const turnstile = checks.find((check) => check.title === TURNSTILE_CHECK);
-  const sameWidget = previous?.turnstileSitekey === ctx.turnstileSitekey && previous?.hostname === ctx.hostname;
-  const turnstileVerified = turnstile.ok || (!turnstile.rejected && sameWidget && previous?.turnstileVerified === true);
-  let config = { ...saved, turnstileVerified, turnstileEnabled: saved.turnstileEnabled && turnstileVerified, complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
+  const carried = saved.turnstileEnabled && previous?.turnstileSecret === ctx.turnstileSecret && previous?.turnstileVerified === true;
+  const turnstileVerified = turnstile.ok || (!turnstile.rejected && carried);
+  const turnstileEnabled = saved.turnstileEnabled && turnstileVerified;
+  if (!turnstile.ok && turnstileVerified) {
+    turnstile.detail = 'Turnstile siteverify did not answer, so protection stays active with the previously confirmed secret. Run setup again later to recheck.';
+  }
+  if (saved.turnstileEnabled && !turnstileEnabled) {
+    turnstile.detail += ' Turnstile protection is now switched off and signups are not challenged until setup succeeds and you activate again.';
+    console.warn('ghost-guard: setup switched Turnstile off because Cloudflare rejected the widget secret');
+  }
+  let config = { ...saved, turnstileVerified, turnstileEnabled, complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
   if (!await run('Save configuration', async () => {
     config = await writeConfig(env, config, previous?.revision || '');
     return 'Settings are saved in this Worker’s setup store. Install the Ghost snippet, then activate signup protection.';

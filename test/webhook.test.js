@@ -491,3 +491,61 @@ test('a webhook rejected by a cached secret retries once against recently refres
   assert.equal((await worker.fetch(event(), config)).status, 202);
   assert.equal(reads, 2);
 });
+
+test('a webhook refused because cached settings had the labeller off is retried, and refresh failures are throttled', async (t) => {
+  ghost(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let reads = 0;
+  let down = false;
+  const stored = { cleanupEnabled: 'false', labellerDisabled: true };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { reads++; if (down) throw new Error('store outage'); return Response.json({ value: stored }); } }; },
+  };
+  t.mock.method(console, 'error', () => {});
+  const { config } = durable({ SETUP_STORE });
+  assert.equal((await worker.fetch(event(), config)).status, 401);
+  assert.equal(reads, 1);
+  // Setup enabled the labeller in another isolate.
+  Object.assign(stored, {
+    cleanupEnabled: 'true', labellerDisabled: false, adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: env.WEBHOOK_SECRET,
+  });
+  now += 6_000;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  assert.equal(reads, 2);
+  // During a store outage, a bad-signature flood keeps its 401 and costs one
+  // refresh attempt per window, failed or not.
+  now += 10_000;
+  down = true;
+  const before = reads;
+  const forged = () => new Request(event(), { headers: { 'X-Ghost-Signature': 'sha256=00, t=1' } });
+  for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(forged(), config)).status, 401);
+  assert.equal(reads - before, 1);
+});
+
+test('a config read that started before a save does not re-cache pre-save settings', async () => {
+  const { withStoredConfig, forgetStoredConfig } = await import('../src/config.js');
+  let release;
+  let reads = 0;
+  let value = { ghostBasePath: '/old' };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { async fetch() {
+      reads++;
+      const snapshot = value;
+      if (reads === 1) await new Promise((resolve) => { release = resolve; });
+      return Response.json({ value: snapshot });
+    } }; },
+  };
+  const env = { SETUP_STORE };
+  const slow = withStoredConfig(env);
+  await new Promise((resolve) => setImmediate(resolve));
+  value = { ghostBasePath: '/new' };
+  forgetStoredConfig(env);
+  release();
+  assert.equal((await slow).GHOST_BASE_PATH, '/old');
+  assert.equal((await withStoredConfig(env)).GHOST_BASE_PATH, '/new');
+  assert.equal(reads, 2);
+});
