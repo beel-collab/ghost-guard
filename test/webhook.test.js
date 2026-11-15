@@ -467,7 +467,7 @@ test('Worker keeps a delivery that arrives during the final attempt', async (t) 
   assert.equal(storage.data.size, 0);
 });
 
-test('a webhook rejected by a cached secret retries once against recently refreshed settings', async (t) => {
+test('a webhook rejected by a cached secret rechecks the store once per refresh window', async (t) => {
   ghost(t);
   let now = Date.now();
   t.mock.method(Date, 'now', () => now);
@@ -481,15 +481,17 @@ test('a webhook rejected by a cached secret retries once against recently refres
     get() { return { fetch() { reads++; return Response.json({ value: stored }); } }; },
   };
   const { config } = durable({ SETUP_STORE, WEBHOOK_SECRET: '' });
+  // The first rejection rechecks the store once.
   assert.equal((await worker.fetch(event(), config)).status, 401);
-  // An unsigned flood costs no store reads while the copy is fresh.
+  assert.equal(reads, 2);
+  // A flood inside the refresh window costs no further store reads.
   for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(event(), config)).status, 401);
-  assert.equal(reads, 1);
+  assert.equal(reads, 2);
   // Setup saved a new secret in another isolate; the next delivery refreshes once.
   stored.webhookSecret = env.WEBHOOK_SECRET;
   now += 6_000;
   assert.equal((await worker.fetch(event(), config)).status, 202);
-  assert.equal(reads, 2);
+  assert.equal(reads, 3);
 });
 
 test('a webhook refused because cached settings had the labeller off is retried, and refresh failures are throttled', async (t) => {
@@ -506,7 +508,7 @@ test('a webhook refused because cached settings had the labeller off is retried,
   t.mock.method(console, 'error', () => {});
   const { config } = durable({ SETUP_STORE });
   assert.equal((await worker.fetch(event(), config)).status, 401);
-  assert.equal(reads, 1);
+  assert.equal(reads, 2);
   // Setup enabled the labeller in another isolate.
   Object.assign(stored, {
     cleanupEnabled: 'true', labellerDisabled: false, adminApiUrl: env.ADMIN_API_URL,
@@ -514,7 +516,7 @@ test('a webhook refused because cached settings had the labeller off is retried,
   });
   now += 6_000;
   assert.equal((await worker.fetch(event(), config)).status, 202);
-  assert.equal(reads, 2);
+  assert.equal(reads, 3);
   // During a store outage, a bad-signature flood keeps its 401 and costs one
   // refresh attempt per window, failed or not.
   now += 10_000;

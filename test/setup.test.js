@@ -144,8 +144,8 @@ function install(t, state) {
       throw new Error(`Unexpected Cloudflare call ${method} ${url.pathname}`);
     }
     if (url.hostname === 'challenges.cloudflare.com') {
-      assert.equal(new URLSearchParams(bodyText).get('secret'), TURNSTILE_SECRET);
       if (state.turnstileDown) return new Response('upstream error', { status: 502 });
+      assert.equal(new URLSearchParams(bodyText).get('secret'), TURNSTILE_SECRET);
       return json({ success: false, 'error-codes': [state.turnstileRejects ? 'invalid-input-secret' : 'invalid-input-response'] });
     }
     if (url.hostname === 'example.com' && url.pathname === '/ghost-guard/turnstile.js') {
@@ -844,5 +844,47 @@ test('a rerun that switches active Turnstile off says so', async (t) => {
   await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
   state.turnstileRejects = true;
   const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
-  assert.match(rerun, /Turnstile protection is now switched off/);
+  assert.match(rerun, /Turnstile protection is now off because Cloudflare rejected the widget secret/);
+  assert.match(rerun, /Signups are not challenged/);
+});
+
+test('a rotated secret seen during a siteverify outage keeps an active widget active', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  // Rotated in the dashboard; the widget API now returns the new secret.
+  state.widgets[0].secret = 'rotated-secret-SENTINEL';
+  state.turnstileDown = true;
+  const warn = t.mock.method(console, 'warn', () => {});
+  const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
+  const config = store.data.get('config');
+  assert.equal(config.turnstileSecret, 'rotated-secret-SENTINEL');
+  assert.equal(config.turnstileEnabled, true);
+  assert.equal(config.turnstileVerified, false);
+  assert.match(rerun, /protection stays active/);
+  assert.doesNotMatch(rerun, /protection is now off/);
+  assert.equal(warn.mock.callCount(), 0);
+});
+
+test('a failed save after a rejected secret does not report Turnstile as switched off', async (t) => {
+  const state = world();
+  install(t, state);
+  const store = memoryStore(), env = baseEnv(store);
+  await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env);
+  await worker.fetch(formRequest('/ghost-guard/setup', activationFields(store)), env);
+  state.turnstileRejects = true;
+  const warn = t.mock.method(console, 'warn', () => {});
+  const originalFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    // Another tab saves while this run is checking.
+    if (String(input?.url || input).endsWith('/ghost-guard/turnstile.js')) store.data.get('config').revision = 'other-tab';
+    return originalFetch(input, init);
+  });
+  const rerun = await (await worker.fetch(formRequest('/ghost-guard/setup', happyFields), env)).text();
+  assert.match(rerun, /Setup changed in another tab/);
+  assert.doesNotMatch(rerun, /protection is now off/);
+  assert.equal(store.data.get('config').turnstileEnabled, true);
+  assert.equal(warn.mock.callCount(), 0);
 });

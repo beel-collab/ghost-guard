@@ -857,28 +857,43 @@ async function runSetup({ request, env, previous, values, cfToken, adminKey, sec
   })) return { steps, checks: [], secrets, values, ok: false };
 
   const checks = await runChecks(ctx);
-  // Only an explicit rejection of the secret demotes a widget. A siteverify
-  // outage keeps the previous state for the same widget: turning an active
-  // widget off would leave signups without Turnstile.
-  // Only an already-active widget with the same secret is carried over.
   const saved = persisted();
   const turnstile = checks.find((check) => check.title === TURNSTILE_CHECK);
-  const carried = saved.turnstileEnabled && previous?.turnstileSecret === ctx.turnstileSecret && previous?.turnstileVerified === true;
-  const turnstileVerified = turnstile.ok || (!turnstile.rejected && carried);
-  const turnstileEnabled = saved.turnstileEnabled && turnstileVerified;
-  if (!turnstile.ok && turnstileVerified) {
-    turnstile.detail = 'Turnstile siteverify did not answer, so protection stays active with the previously confirmed secret. Run setup again later to recheck.';
-  }
-  if (saved.turnstileEnabled && !turnstileEnabled) {
-    turnstile.detail += ' Turnstile protection is now switched off and signups are not challenged until setup succeeds and you activate again.';
-    console.warn('ghost-guard: setup switched Turnstile off because Cloudflare rejected the widget secret');
-  }
-  let config = { ...saved, turnstileVerified, turnstileEnabled, complete: true, checklist: checks.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })) };
+  const outcome = turnstileOutcome(previous, ctx, turnstile, saved.turnstileEnabled);
+  const demotedNote = outcome.demoted
+    ? `Turnstile protection is now off because ${outcome.demoted}. ${env.TURNSTILE_SECRET ? 'Signups fall back to the TURNSTILE_SECRET set on the Worker' : 'Signups are not challenged'} until setup succeeds and you activate again.`
+    : '';
+  const reported = checks.map((check) => check !== turnstile ? check : {
+    ...check, detail: [outcome.note || check.detail, demotedNote].filter(Boolean).join(' '),
+  });
+  let config = {
+    ...saved, turnstileVerified: outcome.verified, turnstileEnabled: outcome.enabled, complete: true,
+    checklist: reported.map((check) => ({ ...check, detail: scrub(check.detail, secrets) })),
+  };
+  // A failed save changes nothing, so it must not report a demotion.
   if (!await run('Save configuration', async () => {
     config = await writeConfig(env, config, previous?.revision || '');
     return 'Settings are saved in this Worker’s setup store. Install the Ghost snippet, then activate signup protection.';
   })) return { steps, checks, secrets, values, ok: false };
-  return { steps, checks, secrets, values, ok: true, config };
+  if (outcome.demoted) console.warn(`ghost-guard: setup switched Turnstile off because ${outcome.demoted}`);
+  return { steps, checks: reported, secrets, values, ok: true, config };
+}
+
+// Turnstile state after a run. An active widget (same site key and hostname)
+// stays active unless Cloudflare explicitly rejects its secret: a siteverify
+// outage must never switch protection off. Activation needs a confirmed check,
+// so `verified` carries over only for the same, already-verified secret.
+function turnstileOutcome(previous, ctx, check, sameActiveWidget) {
+  const enabled = sameActiveWidget && !check.rejected;
+  const verified = check.ok || (!check.rejected && sameActiveWidget
+    && previous.turnstileSecret === ctx.turnstileSecret && previous.turnstileVerified === true);
+  const wasActive = previous?.complete === true && previous.turnstileEnabled !== false && Boolean(previous.turnstileSecret);
+  return {
+    enabled,
+    verified,
+    note: enabled && !check.ok ? 'Turnstile could not confirm the widget secret right now, so protection stays active. Run setup again later to recheck.' : '',
+    demoted: wasActive && !enabled ? (check.rejected ? 'Cloudflare rejected the widget secret' : 'this run prepared a different Turnstile widget') : '',
+  };
 }
 
 async function readLimited(res) {

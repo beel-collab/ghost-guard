@@ -62,6 +62,22 @@ async function cachedRead(env, maxAge) {
   return value;
 }
 
+const refreshes = new WeakMap();
+
+/** Reads the store now, at most once per isolate per `minInterval` (failed or
+ * not). Returns null when throttled or unavailable. For callers that cannot
+ * retry later, such as Ghost webhooks, so a flood cannot hammer the store. */
+export async function refreshStoredConfig(env, minInterval) {
+  if (!env?.SETUP_STORE) return null;
+  if (Date.now() - (refreshes.get(env.SETUP_STORE) || 0) < minInterval) return null;
+  refreshes.set(env.SETUP_STORE, Date.now());
+  try {
+    return await withStoredConfig(env, { maxAge: 0 });
+  } catch {
+    return null;
+  }
+}
+
 /** `maxAge` bounds how old this isolate's copy may be; 0 always reads the store. */
 export async function withStoredConfig(env, { maxAge = CONFIG_CACHE_MS } = {}) {
   if (!env?.SETUP_STORE) return env;
