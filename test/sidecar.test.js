@@ -306,11 +306,28 @@ test('sidecar streams Ghost Admin uploads and large responses, and caps only bod
   const media = await fetch(`${guard}/blog/content/media/video.mp4`);
   assert.equal(media.headers.get('content-length'), String(big.length));
   assert.equal((await media.arrayBuffer()).byteLength, big.length);
-  for (const path of ['/blog/members/api/send-magic-link/', '/members/?token=abc&action=signup', '/signup-shield/webhooks/member-added']) {
+  for (const path of ['/blog/members/api/send-magic-link/', '/members/?token=abc&action=signup', '/signup-shield/webhooks/member-added', '/ghost-guard/setup']) {
     const response = await fetch(`${guard}${path}`, { method: 'POST', body: big, headers: { 'content-type': 'application/json' } });
     assert.equal(response.status, 413, path);
   }
   assert.equal(received.length, 2);
+});
+
+test('sidecar setup explains the manual steps and proxy errors name ghost-guard', async (t) => {
+  const { guard, calls } = await setup(t);
+  const page = await fetch(`${guard}/Ghost-Guard/setup/`);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /Node sidecar/);
+  assert.match(html, /https:\/\/github.com\/beel-collab\/ghost-guard#quick-start/);
+  assert.equal(page.headers.get('x-frame-options'), 'DENY');
+  assert.match(page.headers.get('content-security-policy'), /default-src 'none'/);
+  assert.equal(calls.length, 0);
+  const { default: workerModule } = await import('../src/worker.js');
+  t.mock.method(workerModule, 'fetch', () => { throw new Error('boom'); });
+  const broken = await fetch(`${guard}/about/`);
+  assert.equal(broken.status, 502);
+  assert.equal(await broken.text(), 'ghost-guard proxy error');
 });
 
 test('sidecar forwards uploads sent with Expect: 100-continue', async (t) => {

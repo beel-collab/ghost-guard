@@ -1,5 +1,5 @@
 services:
-  signup-shield:
+  ghost-guard:
     build:
       context: ..
       dockerfile: sidecar/Dockerfile

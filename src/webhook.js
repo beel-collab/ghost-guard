@@ -1,4 +1,5 @@
 /** Authenticated, additive member labelling shared by Worker and sidecar. */
+import { withStoredConfig } from './config.js';
 const REVIEW_LABEL = 'signup-shield-review';
 
 // Ghost sends each webhook once: a POST with a 2 s timeout that is not retried.
@@ -59,8 +60,14 @@ export class LocalLabelQueue {
   }
 
   // Resolves once every queued label and scheduled retry has finished.
+  // Retry timers are unref'd, so hold the process open while someone waits.
   async idle() {
-    while (this.inflight.size) await Promise.all([...this.inflight]);
+    const keepAlive = setInterval(() => {}, 60_000);
+    try {
+      while (this.inflight.size) await Promise.all([...this.inflight]);
+    } finally {
+      clearInterval(keepAlive);
+    }
   }
 
   #attempt(key, operation, attempt) {
@@ -69,8 +76,9 @@ export class LocalLabelQueue {
       if (attempt >= this.delays.length) return logFailure(error, 'giving up after all retries');
       logFailure(error, 'retrying');
       return new Promise((resolve) => {
-        const timer = setTimeout(resolve, this.delays[attempt]);
-        timer.unref?.();
+        // Unref so a pending retry cannot hold a sidecar process open after the
+        // server stops.
+        setTimeout(resolve, this.delays[attempt]).unref?.();
       }).then(() => this.#attempt(key, operation, attempt + 1));
     });
     const tracked = run.finally(() => this.inflight.delete(tracked));
@@ -103,7 +111,10 @@ export class MemberLabeller {
     const id = await this.storage.get('id');
     if (!id) return;
     try {
-      await labelCurrentMember(this.env, id);
+      // Durable Objects receive deployment env, independently of Worker.fetch.
+      // Reload setup settings on each attempt so retries see corrected config.
+      const env = await withStoredConfig(this.env, { maxAge: 0 });
+      if (env.CLEANUP_ENABLED === 'true') await labelCurrentMember(env, id);
       // A delivery that arrived mid-run has scheduled another pass; keep its state.
       if ((await this.storage.getAlarm()) === null) await this.storage.deleteAll();
     } catch (error) {
@@ -122,20 +133,33 @@ export class MemberLabeller {
   }
 }
 
+let warnedWebhookSecret = false;
+
 export async function handleMemberAddedWebhook(request, env) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
-  if (env.CLEANUP_ENABLED !== 'true') {
-    return json({ ok: false, error: 'cleanup disabled' }, 503);
+  // Signature first. Missing-config details (URL shape, key form) are only
+  // returned after a valid signature, so an unsigned caller cannot probe them.
+  // A labeller that is switched off answers exactly like a bad signature.
+  if (!env.WEBHOOK_SECRET && env.CLEANUP_ENABLED !== 'true') {
+    return json({ ok: false, error: 'invalid signature' }, 401);
   }
-  if (!env.ADMIN_API_URL || !env.ADMIN_API_KEY || !env.WEBHOOK_SECRET) {
-    return json({ ok: false, error: 'admin api and webhook secret must be configured' }, 503);
+  if (!env.WEBHOOK_SECRET) {
+    if (!warnedWebhookSecret) {
+      warnedWebhookSecret = true;
+      console.warn('ghost-guard: webhook rejected because WEBHOOK_SECRET is not set');
+    }
+    return json({ ok: false, error: 'unauthorized' }, 503);
   }
   const raw = await request.text();
   const valid = await verifyGhostWebhook(raw, request.headers.get('X-Ghost-Signature') || '', env.WEBHOOK_SECRET);
   if (!valid) {
     return json({ ok: false, error: 'invalid signature' }, 401);
+  }
+  // Only signed requests learn whether the labeller is switched on.
+  if (env.CLEANUP_ENABLED !== 'true') {
+    return json({ ok: false, error: 'cleanup disabled' }, 503);
   }
   // Labelling runs after the 202, so report settings that can never work now,
   // where Ghost Admin's webhook status shows them. Only signed requests see this.
@@ -283,7 +307,7 @@ async function adminApiRequest(env, path, { method = 'GET', body } = {}) {
 }
 
 // Ghost Admin API keys: a 24-hex-digit key ID and a 64-hex-digit secret.
-const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
+export const ADMIN_KEY_PATTERN = /^[a-f\d]{24}:[a-f\d]{64}$/i;
 
 async function adminApiHeaders(adminApiKey) {
   const apiKey = String(adminApiKey).trim();

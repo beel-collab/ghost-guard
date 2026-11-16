@@ -14,50 +14,82 @@ import { checkSignupIpRateLimit, checkSignupEmailRateLimit } from './rate-limit.
 export { SignupRateLimiter } from './rate-limit.js';
 import { handleMemberAddedWebhook } from './webhook.js';
 export { MemberLabeller } from './webhook.js';
+import { escapeHtml, handleSetup, pageHeaders } from './setup.js';
+import { refreshStoredConfig, withStoredConfig } from './config.js';
+export { SetupStore } from './setup.js';
 
 const BYPASS_HEADER = 'X-Ghost-Signup-Shield';
 const DEFAULT_ACTIONS = 'signup,subscribe,signup-paid';
+const WEBHOOK_REFRESH_MS = 5_000;
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = canonicalPath(url.pathname);
-    // Outside a subfolder install the path belongs to whatever else serves this
-    // hostname, so it goes to the zone's normal origin, not to Ghost. The
-    // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
-    // requests use the same rule, so a lookalike path on a root app still
-    // reaches that app after the checks.
-    const forward = env.SIDECAR === true || insideGhost(path, env)
-      ? (forwarded) => forwardToOrigin(forwarded, env)
-      : (forwarded) => forwardToZone(forwarded);
-
-    if (url.pathname === '/ghost-guard/turnstile.js') {
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
-      }
-      return env.ASSETS.fetch(request);
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      if (error.code !== 'SETUP_CONFIG_UNAVAILABLE') throw error;
+      return portalError('Signup protection is temporarily unavailable. Please try again later.', 503);
     }
-
-    // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
-    // serves these under <subfolder>/members, and covering a lookalike path
-    // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
-    if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
-      return handleSendMagicLink(request, env, forward);
-    }
-
-    if (url.pathname === '/signup-shield/webhooks/member-added') {
-      return handleMemberAddedWebhook(request, env);
-    }
-
-    if (path.endsWith('/members') && url.searchParams.has('token')) {
-      return handleMagicLink(request, url, env, forward);
-    }
-
-    return forward(request);
   },
 };
 
-async function handleSendMagicLink(request, env, forward) {
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+  const path = canonicalPath(url.pathname);
+  if (path === '/ghost-guard/setup') return handleSetup(request, env);
+  // Read once per protected request. Ordinary same-zone pages and assets
+  // don't need setup settings. Direct-origin routing does need the base path.
+  let configPromise;
+  const config = () => configPromise ||= withStoredConfig(env);
+  // Outside a subfolder install the path belongs to whatever else serves this
+  // hostname, so it goes to the zone's normal origin, not to Ghost. The
+  // sidecar has no zone origin; nginx only sends it Ghost's paths. Protected
+  // requests use the same rule, so a lookalike path on a root app still
+  // reaches that app after the checks.
+  // If setup storage is down, plain forwarding falls back to the deployment's
+  // own settings rather than taking every page and asset down with it.
+  const forward = async (forwarded) => {
+    const routingEnv = env.GHOST_ORIGIN && env.SETUP_STORE ? await config().catch(() => env) : env;
+    return routingEnv.SIDECAR === true || insideGhost(path, routingEnv)
+      ? forwardToOrigin(forwarded, routingEnv)
+      : forwardToZone(forwarded);
+  };
+
+  if (path === '/ghost-guard/turnstile.js') {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, HEAD' } });
+    }
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = '/ghost-guard/turnstile.js';
+    return env.ASSETS.fetch(new Request(assetUrl, { method: request.method, headers: request.headers }));
+  }
+
+  // Protection is decided by suffix, whatever GHOST_BASE_PATH says: Ghost only
+  // serves these under <subfolder>/members, and covering a lookalike path
+  // elsewhere is harmless. A wrong base path can then misroute, never unprotect.
+  if (path.endsWith('/members/api/send-magic-link') && request.method === 'POST') {
+    return handleSendMagicLink(request, config, forward);
+  }
+
+  if (url.pathname === '/signup-shield/webhooks/member-added') {
+    // Ghost never retries a delivery. If the cached settings reject it (bad
+    // secret, labeller off, missing credentials), setup may have just changed
+    // them in another isolate: recheck once against the store (throttled).
+    const retry = env.SETUP_STORE ? request.clone() : null;
+    const response = await handleMemberAddedWebhook(request, await config());
+    if (![401, 503].includes(response.status) || !retry) return response;
+    const latest = await refreshStoredConfig(env, WEBHOOK_REFRESH_MS);
+    return latest ? handleMemberAddedWebhook(retry, latest) : response;
+  }
+
+  if (path.endsWith('/members') && url.searchParams.has('token')) {
+    return handleMagicLink(request, url, env, forward);
+  }
+
+  return forward(request);
+}
+
+async function handleSendMagicLink(request, config, forward) {
   let body;
   try {
     body = await request.clone().json();
@@ -74,6 +106,8 @@ async function handleSendMagicLink(request, env, forward) {
   if (typeof body.email !== 'string' || !body.email.trim()) {
     return portalError('Please enter an email address.', 400);
   }
+
+  const env = await config();
 
   // Bound verification traffic even when every challenge is missing or invalid.
   const ipError = await rateLimitRejection(checkSignupIpRateLimit(request, env));
@@ -149,7 +183,7 @@ function insideGhost(path, env) {
 // The sidecar buffers and size-limits only the bodies ghost-guard reads.
 export function readsRequestBody(pathname) {
   const path = canonicalPath(pathname);
-  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/');
+  return path.endsWith('/members/api/send-magic-link') || path.endsWith('/members') || path.startsWith('/signup-shield/') || path === '/ghost-guard/setup';
 }
 
 // Lowercased, without trailing slashes, and with repeated slashes collapsed:
@@ -212,7 +246,15 @@ async function confirmAndForward(request, url, env, forward) {
   let referrer = url.searchParams.get('r');
 
   if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
-    const form = await request.formData();
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return new Response(renderInterstitial(url, env, 'The confirmation form was invalid. Please try again.'), {
+        status: 400,
+        headers: htmlHeaders(),
+      });
+    }
     token = String(form.get('token') || token || '');
     action = String(form.get('action') || action || '');
     referrer = String(form.get('r') || referrer || '');
@@ -318,21 +360,11 @@ async function verifyTurnstile(token, env, request) {
 }
 
 function htmlHeaders() {
-  return {
-    'content-type': 'text/html; charset=utf-8',
-    'cache-control': 'no-store, no-cache, must-revalidate',
-    'x-content-type-options': 'nosniff',
-    'referrer-policy': 'no-referrer',
-  };
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  const headers = pageHeaders();
+  // Ghost may redirect a successful confirmation to an external welcome page.
+  // Chromium also checks form-action on that redirect after consuming the token.
+  headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+  return headers;
 }
 
 function renderInterstitial(url, env, error) {

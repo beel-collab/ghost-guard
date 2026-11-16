@@ -20,6 +20,10 @@ class_name = "SignupRateLimiter"
 name = "MEMBER_LABELLER"
 class_name = "MemberLabeller"
 
+[[durable_objects.bindings]]
+name = "SETUP_STORE"
+class_name = "SetupStore"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SignupRateLimiter"]
@@ -28,8 +32,15 @@ new_sqlite_classes = ["SignupRateLimiter"]
 tag = "v2"
 new_sqlite_classes = ["MemberLabeller"]
 
-# Secrets: CONFIRM_SECRET, GHOST_ORIGIN, TURNSTILE_SECRET,
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SetupStore"]
+
+# Secrets: SETUP_TOKEN, CONFIRM_SECRET, GHOST_ORIGIN, TURNSTILE_SECRET,
 # ADMIN_API_KEY and WEBHOOK_SECRET. Never commit real secrets.
+# SETUP_TOKEN locks /ghost-guard/setup. The Deploy button asks for it
+# (.dev.vars.example). Guided setup stores its managed settings only in
+# SETUP_STORE; these override the corresponding manual environment settings.
 [vars]
 INTERSTITIAL_ACTIONS = "signup,subscribe,signup-paid"
 SITE_TITLE = "this publication"

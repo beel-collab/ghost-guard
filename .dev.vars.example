@@ -1,0 +1,5 @@
+# Password for /ghost-guard/setup. The Deploy to Cloudflare button asks for this.
+# Use a long random string. An empty value is treated as unset, and the Worker
+# then generates a token and prints it only to its logs (wrangler tail).
+# Guided setup stores Turnstile and optional labeller settings in SETUP_STORE.
+SETUP_TOKEN=

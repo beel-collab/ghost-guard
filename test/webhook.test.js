@@ -216,12 +216,36 @@ for (const [name, config] of [
   });
 }
 
+test('unsigned requests cannot tell whether the labeller is switched on', async (t) => {
+  ghost(t);
+  const unsigned = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
+  const on = await worker.fetch(unsigned(), env);
+  const off = await worker.fetch(unsigned(), { ...env, CLEANUP_ENABLED: 'false' });
+  const offViaSetup = await worker.fetch(unsigned(), { ...env, CLEANUP_ENABLED: 'false', WEBHOOK_SECRET: '' });
+  const onBody = await on.json();
+  for (const response of [off, offViaSetup]) {
+    assert.equal(response.status, on.status);
+    assert.deepEqual(await response.json(), onBody);
+  }
+});
+
 test('unsigned requests learn nothing about the Admin API configuration', async (t) => {
   ghost(t);
   const unsigned = new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
   const response = await worker.fetch(unsigned, { ...env, ADMIN_API_KEY: 'id:secret', LOCAL_MEMBER_LABELLER: new LocalLabelQueue([]) });
   assert.equal(response.status, 401);
   assert.doesNotMatch(await response.text(), /ADMIN_API/);
+});
+
+test('missing admin configuration is not described until the signature is valid', async (t) => {
+  t.mock.method(console, 'warn', () => {});
+  const unsigned = () => new Request('https://blog.example/signup-shield/webhooks/member-added', { method: 'POST', body: '{}' });
+  const missingSecret = await worker.fetch(unsigned(), { ...env, WEBHOOK_SECRET: undefined, ADMIN_API_URL: 'not a url', ADMIN_API_KEY: 'id:secret' });
+  assert.equal(missingSecret.status, 503);
+  assert.doesNotMatch(await missingSecret.text(), /ADMIN_API|not a url|id:secret|webhook secret/);
+  const missingAdmin = await worker.fetch(unsigned(), { ...env, ADMIN_API_URL: '', ADMIN_API_KEY: '' });
+  assert.equal(missingAdmin.status, 401);
+  assert.doesNotMatch(await missingAdmin.text(), /ADMIN_API|configured/);
 });
 
 test('sidecar does not retry errors that retrying cannot fix', async (t) => {
@@ -270,7 +294,8 @@ test('the queue allows different members to proceed independently', async () => 
 
 // Worker delivery: the Durable Object stores the member and labels from its alarm.
 
-function durable() {
+function durable(overrides = {}) {
+  const deploymentEnv = { ...env, ...overrides };
   const data = new Map();
   const storage = {
     data, alarm: null,
@@ -280,15 +305,64 @@ function durable() {
     async getAlarm() { return storage.alarm; },
     async setAlarm(time) { storage.alarm = time; },
   };
-  const object = new MemberLabeller({ storage }, env);
+  const object = new MemberLabeller({ storage }, deploymentEnv);
   // The runtime clears the alarm before invoking the handler.
   const fire = () => { storage.alarm = null; return object.alarm(); };
-  const config = { ...env, MEMBER_LABELLER: {
+  const config = { ...deploymentEnv, MEMBER_LABELLER: {
     idFromName(key) { assert.equal(key, `https://admin.example:${memberId}`); return key; },
     get() { return { fetch: (input, init) => object.fetch(new Request(input, init)) }; },
   } };
   return { storage, fire, config };
 }
+
+test('Worker alarms reload stored settings and retry storage outages without calling Ghost', async (t) => {
+  const state = ghost(t);
+  let unavailable = false;
+  const stored = {
+    cleanupEnabled: 'true', adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: env.WEBHOOK_SECRET,
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() {
+      if (unavailable) throw new Error('store outage');
+      return Response.json({ value: stored });
+    } }; },
+  };
+  const { storage, fire, config } = durable({
+    SETUP_STORE, CLEANUP_ENABLED: 'false', ADMIN_API_URL: '', ADMIN_API_KEY: '', WEBHOOK_SECRET: '',
+  });
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  unavailable = true;
+  t.mock.method(console, 'warn', () => {});
+  await fire();
+  assert.equal(state.calls.length, 0);
+  assert.equal(storage.data.get('attempt'), 1);
+  assert.ok(storage.alarm > Date.now());
+  unavailable = false;
+  await fire();
+  assert.equal(state.member.labels.filter(item => item.name === label.name).length, 1);
+  assert.equal(storage.data.size, 0);
+});
+
+test('a pending alarm stops when the labeller is disabled in saved configuration', async (t) => {
+  const state = ghost(t);
+  const saved = {
+    cleanupEnabled:'true', adminApiUrl:env.ADMIN_API_URL,
+    adminApiKey:env.ADMIN_API_KEY, webhookSecret:env.WEBHOOK_SECRET,
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { return Response.json({value:saved}); } }; },
+  };
+  const { storage, fire, config } = durable({SETUP_STORE});
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  saved.cleanupEnabled = 'false';
+  saved.labellerDisabled = true;
+  await fire();
+  assert.equal(state.calls.length, 0);
+  assert.equal(storage.data.size, 0);
+});
 
 test('Worker acknowledges at once and labels from the Durable Object alarm', async (t) => {
   const state = ghost(t);
@@ -391,4 +465,89 @@ test('Worker keeps a delivery that arrives during the final attempt', async (t) 
   await fire();
   assert.equal(state.member.labels.filter((item) => item.name === label.name).length, 1);
   assert.equal(storage.data.size, 0);
+});
+
+test('a webhook rejected by a cached secret rechecks the store once per refresh window', async (t) => {
+  ghost(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let reads = 0;
+  const stored = {
+    cleanupEnabled: 'true', adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: 'old-secret',
+  };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { reads++; return Response.json({ value: stored }); } }; },
+  };
+  const { config } = durable({ SETUP_STORE, WEBHOOK_SECRET: '' });
+  // The first rejection rechecks the store once.
+  assert.equal((await worker.fetch(event(), config)).status, 401);
+  assert.equal(reads, 2);
+  // A flood inside the refresh window costs no further store reads.
+  for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(event(), config)).status, 401);
+  assert.equal(reads, 2);
+  // Setup saved a new secret in another isolate; the next delivery refreshes once.
+  stored.webhookSecret = env.WEBHOOK_SECRET;
+  now += 6_000;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  assert.equal(reads, 3);
+});
+
+test('a webhook refused because cached settings had the labeller off is retried, and refresh failures are throttled', async (t) => {
+  ghost(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let reads = 0;
+  let down = false;
+  const stored = { cleanupEnabled: 'false', labellerDisabled: true };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { fetch() { reads++; if (down) throw new Error('store outage'); return Response.json({ value: stored }); } }; },
+  };
+  t.mock.method(console, 'error', () => {});
+  const { config } = durable({ SETUP_STORE });
+  assert.equal((await worker.fetch(event(), config)).status, 401);
+  assert.equal(reads, 2);
+  // Setup enabled the labeller in another isolate.
+  Object.assign(stored, {
+    cleanupEnabled: 'true', labellerDisabled: false, adminApiUrl: env.ADMIN_API_URL,
+    adminApiKey: env.ADMIN_API_KEY, webhookSecret: env.WEBHOOK_SECRET,
+  });
+  now += 6_000;
+  assert.equal((await worker.fetch(event(), config)).status, 202);
+  assert.equal(reads, 3);
+  // During a store outage, a bad-signature flood keeps its 401 and costs one
+  // refresh attempt per window, failed or not.
+  now += 10_000;
+  down = true;
+  const before = reads;
+  const forged = () => new Request(event(), { headers: { 'X-Ghost-Signature': 'sha256=00, t=1' } });
+  for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(forged(), config)).status, 401);
+  assert.equal(reads - before, 1);
+});
+
+test('a config read that started before a save does not re-cache pre-save settings', async () => {
+  const { withStoredConfig, forgetStoredConfig } = await import('../src/config.js');
+  let release;
+  let reads = 0;
+  let value = { ghostBasePath: '/old' };
+  const SETUP_STORE = {
+    idFromName(name) { return name; },
+    get() { return { async fetch() {
+      reads++;
+      const snapshot = value;
+      if (reads === 1) await new Promise((resolve) => { release = resolve; });
+      return Response.json({ value: snapshot });
+    } }; },
+  };
+  const env = { SETUP_STORE };
+  const slow = withStoredConfig(env);
+  await new Promise((resolve) => setImmediate(resolve));
+  value = { ghostBasePath: '/new' };
+  forgetStoredConfig(env);
+  release();
+  assert.equal((await slow).GHOST_BASE_PATH, '/old');
+  assert.equal((await withStoredConfig(env)).GHOST_BASE_PATH, '/new');
+  assert.equal(reads, 2);
 });
