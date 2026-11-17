@@ -405,7 +405,7 @@ function renderInterstitial(url, env, error) {
 <body>
   <main>
     <h1>Confirm your subscription</h1>
-    <p>One last step to finish signing up for ${title}. This extra click keeps automated email scanners from creating an account in your name.</p>
+    <p>One last step to finish signing up for ${title}.</p>
     ${errorHtml}
     <form method="post" action="">
       <input type="hidden" name="token" value="${token}">
